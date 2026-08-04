@@ -106,8 +106,39 @@ DuckLakeColumnStats DuckLakeInsert::ParseColumnStats(const LogicalType &type, co
 	return column_stats;
 }
 
-void DuckLakeInsert::AddWrittenFiles(DuckLakeInsertGlobalState &global_state, DataChunk &chunk,
+void DuckLakeInsert::AddWrittenFiles(ClientContext &context, DuckLakeInsertGlobalState &global_state, DataChunk &chunk,
                                      const string &encryption_key, optional_idx partition_id, bool set_snapshot_id) {
+	if (global_state.file_format != "parquet") {
+		// non-parquet writers return CHANGED_ROWS_AND_FILE_LIST: {count, files[]}. There are no per-file
+		// stats, so derive the size from the filesystem and map the whole row count to the single file.
+		auto &fs = FileSystem::GetFileSystem(context);
+		for (idx_t r = 0; r < chunk.size(); r++) {
+			auto files_value = chunk.GetValue(1, r);
+			if (files_value.IsNull()) {
+				continue;
+			}
+			auto &file_list = ListValue::GetChildren(files_value);
+			if (file_list.empty()) {
+				continue;
+			}
+			if (file_list.size() != 1) {
+				throw NotImplementedException("Writing '%s' data files is only supported as a single file per write",
+				                              global_state.file_format);
+			}
+			DuckLakeDataFile data_file;
+			data_file.file_name = file_list[0].GetValue<string>();
+			data_file.file_format = global_state.file_format;
+			data_file.row_count = chunk.GetValue(0, r).GetValue<idx_t>();
+			auto handle = fs.OpenFile(data_file.file_name, FileFlags::FILE_FLAGS_READ);
+			data_file.file_size_bytes = NumericCast<idx_t>(fs.GetFileSize(*handle));
+			data_file.encryption_key = encryption_key;
+			if (partition_id.IsValid()) {
+				data_file.partition_id = partition_id.GetIndex();
+			}
+			global_state.written_files.push_back(std::move(data_file));
+		}
+		return;
+	}
 	for (idx_t r = 0; r < chunk.size(); r++) {
 		DuckLakeDataFile data_file;
 		data_file.file_name = chunk.GetValue(0, r).GetValue<string>();
@@ -216,7 +247,7 @@ void DuckLakeInsert::AddWrittenFiles(DuckLakeInsertGlobalState &global_state, Da
 
 SinkResultType DuckLakeInsert::Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const {
 	auto &global_state = input.global_state.Cast<DuckLakeInsertGlobalState>();
-	AddWrittenFiles(global_state, chunk, encryption_key, partition_id);
+	AddWrittenFiles(context.client, global_state, chunk, encryption_key, partition_id);
 	return SinkResultType::NEED_MORE_INPUT;
 }
 
@@ -634,7 +665,24 @@ DuckLakeCopyOptions DuckLakeInsert::GetCopyOptions(ClientContext &context, DuckL
 	result.overwrite_mode = CopyOverwriteMode::COPY_OVERWRITE_OR_IGNORE;
 	result.per_thread_output = per_thread_output;
 	result.write_partition_columns = true;
-	result.return_type = CopyFunctionReturnType::WRITTEN_FILE_STATISTICS;
+	if (is_parquet) {
+		result.return_type = CopyFunctionReturnType::WRITTEN_FILE_STATISTICS;
+	} else {
+		// non-parquet COPY functions (vortex) can't report per-file statistics; take the written file
+		// list instead and derive size/row-count ourselves. They also don't implement rotate_next_file,
+		// so we can't use DuckDB's directory+rotation naming - generate a single full file path here
+		// (the plain single-file COPY path) so the writer receives a file, not the table directory.
+		result.return_type = CopyFunctionReturnType::CHANGED_ROWS_AND_FILE_LIST;
+		result.rotate = false;
+		result.per_thread_output = false;
+		result.partition_output = false;
+		result.file_size_bytes = optional_idx();
+		auto &transaction = DuckLakeTransaction::Get(context, catalog);
+		auto file_name = "ducklake-" + transaction.GenerateUUID() + "." + data_file_format;
+		result.file_path = fs.JoinPath(copy_input.data_path, file_name);
+		result.file_extension = "";
+		result.write_empty_file = false;
+	}
 	result.names = names_to_write;
 	result.expected_types = types_to_write;
 
@@ -726,7 +774,7 @@ PhysicalOperator &DuckLakeInsert::PlanCopyForInsert(ClientContext &context, Phys
 		}
 	}
 
-	auto copy_return_types = GetCopyFunctionReturnLogicalTypes(CopyFunctionReturnType::WRITTEN_FILE_STATISTICS);
+	auto copy_return_types = GetCopyFunctionReturnLogicalTypes(copy_options.return_type);
 	auto &physical_copy = planner
 	                          .Make<PhysicalCopyToFile>(copy_return_types, std::move(copy_options.copy_function),
 	                                                    std::move(copy_options.bind_data), 1)

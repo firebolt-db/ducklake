@@ -1,0 +1,108 @@
+# name: test/sql/vortex/vortex_write.test
+# description: INSERT/CTAS into a vortex-format DuckLake table and read it back (full round trip)
+# group: [vortex]
+
+require ducklake
+
+require parquet
+
+require vortex
+
+statement ok
+ATTACH 'ducklake:{TEST_DIR}/dl_vw.db' AS ducklake (DATA_PATH '{TEST_DIR}/dl_vw_files', METADATA_CATALOG 'ducklake_meta')
+
+statement ok
+CALL ducklake.set_option('data_inlining_row_limit', 0)
+
+statement ok
+CALL ducklake.set_option('data_file_format', 'vortex')
+
+statement ok
+CREATE TABLE ducklake.t(i INTEGER, s VARCHAR, d DOUBLE, l INTEGER[])
+
+statement ok
+INSERT INTO ducklake.t VALUES (1, 'a', 1.5, [1, 2]), (2, 'bb', NULL, []), (3, 'ccc', 3.5, [9])
+
+# a second insert -> a second vortex file
+statement ok
+INSERT INTO ducklake.t VALUES (4, 'd', 4.5, [4])
+
+# both writes recorded as vortex, with real row counts and file sizes
+query III
+SELECT file_format, SUM(record_count), bool_and(file_size_bytes > 0)
+FROM ducklake_meta.ducklake_data_file WHERE end_snapshot IS NULL GROUP BY file_format
+----
+vortex	4	true
+
+# the data files really are .vortex files
+query I
+SELECT COUNT(*) FROM glob('{TEST_DIR}/dl_vw_files/**/*.vortex')
+----
+2
+
+# full round-trip read (types, NULLs, nested list, across both files)
+query IITR
+SELECT i, s, l, d FROM ducklake.t ORDER BY i
+----
+1	a	[1, 2]	1.5
+2	bb	[]	NULL
+3	ccc	[9]	3.5
+4	d	[4]	4.5
+
+# filter pushdown across statless vortex files
+query IT
+SELECT i, s FROM ducklake.t WHERE i >= 3 ORDER BY i
+----
+3	ccc
+4	d
+
+query IT
+SELECT i, s FROM ducklake.t WHERE s = 'bb'
+----
+2	bb
+
+query II
+SELECT COUNT(*), SUM(i) FROM ducklake.t
+----
+4	10
+
+# deletes on vortex-backed rows
+statement ok
+DELETE FROM ducklake.t WHERE i = 2
+
+query IT
+SELECT i, s FROM ducklake.t ORDER BY i
+----
+1	a
+3	ccc
+4	d
+
+# updates
+statement ok
+UPDATE ducklake.t SET s = 'updated' WHERE i = 1
+
+query IT
+SELECT i, s FROM ducklake.t WHERE i = 1
+----
+1	updated
+
+# CTAS into vortex format
+statement ok
+CREATE TABLE ducklake.ctas AS SELECT range AS r, range * 2 AS r2 FROM range(1000)
+
+query I
+SELECT DISTINCT file_format FROM ducklake_meta.ducklake_data_file d
+    JOIN ducklake_meta.ducklake_table t USING (table_id)
+WHERE t.table_name = 'ctas' AND d.end_snapshot IS NULL
+----
+vortex
+
+query II
+SELECT COUNT(*), SUM(r2) FROM ducklake.ctas
+----
+1000	999000
+
+query I
+SELECT r FROM ducklake.ctas WHERE r = 500
+----
+500
