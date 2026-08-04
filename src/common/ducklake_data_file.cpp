@@ -25,6 +25,7 @@ DeleteFileFormat DeleteFileFormatFromString(const string &str) {
 
 DuckLakeDataFile::DuckLakeDataFile(const DuckLakeDataFile &other) {
 	file_name = other.file_name;
+	file_format = other.file_format;
 	row_count = other.row_count;
 	file_size_bytes = other.file_size_bytes;
 	footer_size = other.footer_size;
@@ -42,6 +43,7 @@ DuckLakeDataFile::DuckLakeDataFile(const DuckLakeDataFile &other) {
 
 DuckLakeDataFile &DuckLakeDataFile::operator=(const DuckLakeDataFile &other) {
 	file_name = other.file_name;
+	file_format = other.file_format;
 	row_count = other.row_count;
 	file_size_bytes = other.file_size_bytes;
 	footer_size = other.footer_size;

@@ -15,21 +15,16 @@
 namespace duckdb {
 struct DuckLakeFunctionInfo;
 
-//! Marks how a single output column of the DuckLakeFormatReader is produced.
+//! How an output column is produced.
 enum class FormatReaderColumn : uint8_t {
-	//! Projected directly from the underlying read_<format> scan (see source_index)
-	FILE_COLUMN,
-	//! Ordinal position of the row within the file (row_id_start + file_row_number is applied by the
-	//! MultiFileReader on top). Emitted by the reader itself.
-	ORDINAL,
-	//! Column that is not present in the file - emit its default value (usually NULL)
-	MISSING
+	FILE_COLUMN, //! read from the file (see output_source_index)
+	ORDINAL,     //! file_row_number, emitted by the reader
+	MISSING      //! not in the file -> NULL
 };
 
-//! Reads a single DuckLake data file stored in a non-parquet format (e.g. "vortex", "json"). It drives
-//! the format's `read_<format>` table function for the physical file and adapts the produced chunks to
-//! DuckLake's MultiFileReader contract (column mapping, positional delete filters, pushed-down filters
-//! and the file_row_number virtual column) exactly like the parquet reader path does.
+//! Reads a single non-parquet DuckLake data file ("vortex", "json", ...) by driving its read_<format>
+//! table function and adapting the chunks to DuckLake's MultiFileReader contract (column mapping,
+//! delete filters, pushed-down filters, file_row_number), like the parquet reader path does.
 class DuckLakeFormatReader : public BaseFileReader {
 public:
 	DuckLakeFormatReader(DuckLakeFunctionInfo &read_info, const OpenFileInfo &info, string format,
@@ -44,17 +39,15 @@ public:
 	void AddVirtualColumn(column_t virtual_column_id) override;
 
 private:
-	//! Look up the `read_<format>` table function (auto-loading the format's extension if available).
 	static TableFunction GetReadFunction(ClientContext &context, const string &format);
 
 	mutex lock;
 	DuckLakeFunctionInfo &read_info;
-	//! The physical format of the file ("vortex", "json", ...); selects the read_<format> function.
-	string format;
+	string format; //! selects the read_<format> function
 	bool initialized_scan = false;
 	int64_t file_row_number = 0;
 
-	//! Underlying read_<format> scan bound to the physical file.
+	//! read_<format> scan bound to the file
 	TableFunction file_scan;
 	unique_ptr<FunctionData> bind_data;
 	vector<LogicalType> file_types;
@@ -65,14 +58,10 @@ private:
 	unique_ptr<GlobalTableFunctionState> global_state;
 	unique_ptr<LocalTableFunctionState> local_state;
 
-	//! Column ids projected out of the file (indexes into file_names/file_types).
-	vector<column_t> scan_column_ids;
-	//! Chunk holding the raw columns read from read_<format> (in scan_column_ids order).
-	DataChunk scan_chunk;
-	//! For each output column: how it is produced.
-	vector<FormatReaderColumn> output_kinds;
-	//! For FILE_COLUMN outputs: the position within scan_chunk to reference.
-	vector<idx_t> output_source_index;
+	vector<column_t> scan_column_ids;              //! columns projected out of the file
+	DataChunk scan_chunk;                          //! raw columns read from the file
+	vector<FormatReaderColumn> output_kinds;       //! how each output column is produced
+	vector<idx_t> output_source_index;             //! for FILE_COLUMN: position in scan_chunk
 };
 
 } // namespace duckdb

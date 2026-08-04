@@ -37,6 +37,8 @@ public:
 	case_insensitive_set_t not_null_fields;
 	//! Total rows flushed (used by flush_inlined_data)
 	idx_t rows_flushed = 0;
+	//! Format written files are recorded with (resolved from the table's data_file_format option)
+	string file_format = "parquet";
 };
 
 class DuckLakeInsert : public PhysicalOperator {
@@ -63,8 +65,6 @@ public:
 	optional_idx partition_id;
 	//! The encryption key used for writing the Parquet files
 	string encryption_key;
-	//! The physical format written data files are stored in ("parquet", "vortex", ...)
-	string file_format = "parquet";
 
 public:
 	// // Source interface
@@ -88,8 +88,7 @@ public:
 	static PhysicalOperator &PlanInsert(ClientContext &context, PhysicalPlanGenerator &planner,
 	                                    DuckLakeTableEntry &table, string encryption_key);
 	static void AddWrittenFiles(DuckLakeInsertGlobalState &gstate, DataChunk &chunk, const string &encryption_key,
-	                            optional_idx partition_id, bool set_snapshot_id = false,
-	                            const string &file_format = "parquet");
+	                            optional_idx partition_id, bool set_snapshot_id = false);
 
 	static const DuckLakeFieldId &GetTopLevelColumn(DuckLakeCopyInput &copy_input, FieldIndex field_id,
 	                                                optional_idx &index);

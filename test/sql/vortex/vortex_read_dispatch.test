@@ -1,0 +1,89 @@
+# name: test/sql/vortex/vortex_read_dispatch.test
+# description: DuckLake scans data files tagged file_format='vortex' via read_vortex (per-file dispatch)
+# group: [vortex]
+#
+# Writes a real .vortex file with the vortex extension's own COPY, registers it into DuckLake by
+# tagging the data file's file_format='vortex', and verifies DuckLake reads it back through the
+# generic DuckLakeFormatReader (driving read_vortex).
+
+require ducklake
+
+require parquet
+
+require vortex
+
+statement ok
+ATTACH 'ducklake:{TEST_DIR}/dl_vr.db' AS ducklake (DATA_PATH '{TEST_DIR}/dl_vr_files', METADATA_CATALOG 'ducklake_meta')
+
+statement ok
+CALL ducklake.set_option('data_inlining_row_limit', 0)
+
+statement ok
+CREATE TABLE ducklake.t(i INTEGER, s VARCHAR)
+
+statement ok
+INSERT INTO ducklake.t VALUES (1, 'a'), (2, 'bb'), (3, 'ccc')
+
+query I
+SELECT DISTINCT file_format FROM ducklake_meta.ducklake_data_file
+----
+parquet
+
+# write the same rows to a real vortex file using the vortex extension's own COPY
+statement ok
+COPY (SELECT i, s FROM ducklake.t ORDER BY i) TO '{TEST_DIR}/injected.vortex' (FORMAT vortex)
+
+# repoint the data file at the vortex file and tag it as vortex
+statement ok
+UPDATE ducklake_meta.ducklake_data_file
+SET path = '{TEST_DIR}/injected.vortex', path_is_relative = false, file_format = 'vortex'
+WHERE end_snapshot IS NULL
+
+statement ok
+DETACH ducklake
+
+statement ok
+ATTACH 'ducklake:{TEST_DIR}/dl_vr.db' AS ducklake (DATA_PATH '{TEST_DIR}/dl_vr_files', METADATA_CATALOG 'ducklake_meta')
+
+# the scan now dispatches to read_vortex
+query IT
+SELECT i, s FROM ducklake.t ORDER BY i
+----
+1	a
+2	bb
+3	ccc
+
+# projection pushdown through the vortex reader
+query T
+SELECT s FROM ducklake.t ORDER BY i
+----
+a
+bb
+ccc
+
+# filter pushdown through the vortex reader
+query IT
+SELECT i, s FROM ducklake.t WHERE i >= 2 ORDER BY i
+----
+2	bb
+3	ccc
+
+query II
+SELECT COUNT(*), SUM(i) FROM ducklake.t
+----
+3	6
+
+# deletes apply positionally on top of the vortex reader
+statement ok
+DELETE FROM ducklake.t WHERE i = 2
+
+query IT
+SELECT i, s FROM ducklake.t ORDER BY i
+----
+1	a
+3	ccc
+
+query I
+SELECT COUNT(*) FROM ducklake.t
+----
+2

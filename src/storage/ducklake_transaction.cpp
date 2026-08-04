@@ -2602,7 +2602,7 @@ unique_ptr<QueryResult> DuckLakeTransaction::Query(string query) {
 	if (cb) {
 		cb(query, end - start);
 	}
-	return result;
+	return unique_ptr<QueryResult>(result.release());
 }
 
 unique_ptr<QueryResult> DuckLakeTransaction::Query(DuckLakeSnapshot snapshot, string query) {

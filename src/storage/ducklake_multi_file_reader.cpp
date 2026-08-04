@@ -394,17 +394,34 @@ shared_ptr<BaseFileReader> DuckLakeMultiFileReader::TryCreateFormatReader(Client
 	}
 	auto entry = file.extended_info->options.find("file_format");
 	if (entry == file.extended_info->options.end()) {
-		// no format recorded - default parquet path
 		return nullptr;
 	}
 	auto format = StringUtil::Lower(StringValue::Get(entry->second));
 	if (format.empty() || format == "parquet") {
-		// parquet is read by the native parquet reader path
+		// parquet uses the native reader path
 		return nullptr;
 	}
-	// Non-parquet format: map the file's columns onto the table's current field ids by name and read it
-	// via the format's read_<format> table function.
 	auto columns = DuckLakeMultiFileReader::ColumnsFromFieldData(read_info.table.GetFieldData(), true);
+	// if the file has a name map (e.g. columns were renamed after it was written), look columns up by
+	// their physical name in the file instead of the current schema name
+	auto mapping_entry = file.extended_info->options.find("mapping_id");
+	if (mapping_entry != file.extended_info->options.end()) {
+		auto mapping_id = MappingIndex(mapping_entry->second.GetValue<idx_t>());
+		auto &name_map = read_info.GetTransaction()->GetMappingById(mapping_id);
+		unordered_map<idx_t, string> physical_names;
+		for (auto &column_map : name_map.column_maps) {
+			physical_names[column_map->target_field_id.index] = column_map->source_name;
+		}
+		for (auto &col : columns) {
+			if (col.identifier.IsNull() || col.identifier.type().id() != LogicalTypeId::INTEGER) {
+				continue;
+			}
+			auto name_entry = physical_names.find(IntegerValue::Get(col.identifier));
+			if (name_entry != physical_names.end()) {
+				col.name = name_entry->second;
+			}
+		}
+	}
 	return make_shared_ptr<DuckLakeFormatReader>(read_info, file, std::move(format), std::move(columns));
 }
 

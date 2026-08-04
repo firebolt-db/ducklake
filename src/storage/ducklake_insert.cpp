@@ -45,6 +45,10 @@ DuckLakeInsert::DuckLakeInsert(PhysicalPlan &physical_plan, const vector<Logical
 //===--------------------------------------------------------------------===//
 DuckLakeInsertGlobalState::DuckLakeInsertGlobalState(DuckLakeTableEntry &table)
     : table(table), total_insert_count(0), not_null_fields(table.GetNotNullFields()) {
+	// record written files with the same format GetCopyOptions writes them in
+	auto &catalog = table.ParentCatalog().Cast<DuckLakeCatalog>();
+	catalog.TryGetConfigOption("data_file_format", file_format, table);
+	file_format = DuckLakeInsert::ValidateDataFileFormat(file_format);
 }
 
 unique_ptr<GlobalSinkState> DuckLakeInsert::GetGlobalSinkState(ClientContext &context) const {
@@ -103,12 +107,11 @@ DuckLakeColumnStats DuckLakeInsert::ParseColumnStats(const LogicalType &type, co
 }
 
 void DuckLakeInsert::AddWrittenFiles(DuckLakeInsertGlobalState &global_state, DataChunk &chunk,
-                                     const string &encryption_key, optional_idx partition_id, bool set_snapshot_id,
-                                     const string &file_format) {
+                                     const string &encryption_key, optional_idx partition_id, bool set_snapshot_id) {
 	for (idx_t r = 0; r < chunk.size(); r++) {
 		DuckLakeDataFile data_file;
 		data_file.file_name = chunk.GetValue(0, r).GetValue<string>();
-		data_file.file_format = file_format;
+		data_file.file_format = global_state.file_format;
 		data_file.row_count = chunk.GetValue(1, r).GetValue<idx_t>();
 		data_file.file_size_bytes = chunk.GetValue(2, r).GetValue<idx_t>();
 		data_file.footer_size = chunk.GetValue(3, r).GetValue<idx_t>();
@@ -213,7 +216,7 @@ void DuckLakeInsert::AddWrittenFiles(DuckLakeInsertGlobalState &global_state, Da
 
 SinkResultType DuckLakeInsert::Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const {
 	auto &global_state = input.global_state.Cast<DuckLakeInsertGlobalState>();
-	AddWrittenFiles(global_state, chunk, encryption_key, partition_id, false, file_format);
+	AddWrittenFiles(global_state, chunk, encryption_key, partition_id);
 	return SinkResultType::NEED_MORE_INPUT;
 }
 
@@ -486,9 +489,7 @@ static void GeneratePartitionExpressions(ClientContext &context, DuckLakeCopyInp
 
 string DuckLakeInsert::ValidateDataFileFormat(string format) {
 	format = StringUtil::Lower(format);
-	// Formats DuckLake can write. Writing requires a COPY function that implements the copy_to_bind API
-	// (parquet and vortex do; e.g. json/csv use the newer plan-based COPY and cannot be written here).
-	// Any such file is read back via the generic format reader (read_<format>).
+	// writable formats need a copy_to_bind COPY (json/csv use the newer plan-based COPY and can't)
 	if (format != "parquet" && format != "vortex") {
 		throw InvalidInputException(
 		    "Unsupported data_file_format \"%s\" - DuckLake can write 'parquet' and 'vortex' data files", format);
@@ -512,8 +513,7 @@ DuckLakeCopyOptions DuckLakeInsert::GetCopyOptions(ClientContext &context, DuckL
 	info->format = data_file_format;
 
 	if (is_parquet) {
-		// generate the field ids to be written by the parquet writer. Non-parquet files are mapped by
-		// column name at read time, so field ids are not written for them.
+		// field ids are parquet-only; non-parquet files are mapped by column name at read time
 		shared_ptr<DuckLakeFieldData> generated_ids;
 		if (!copy_input.field_data) {
 			// CTAS - generate new ids from columns
@@ -535,7 +535,6 @@ DuckLakeCopyOptions DuckLakeInsert::GetCopyOptions(ClientContext &context, DuckL
 		info->options["encryption_config"] = std::move(encryption_input);
 	}
 	if (is_parquet) {
-		// The following options are parquet-writer specific.
 		string parquet_compression;
 		if (catalog.TryGetConfigOption("parquet_compression", parquet_compression, schema_id, table_id)) {
 			info->options["compression"].emplace_back(parquet_compression);
@@ -573,7 +572,6 @@ DuckLakeCopyOptions DuckLakeInsert::GetCopyOptions(ClientContext &context, DuckL
 	// Get the copy function for the chosen data file format
 	auto &copy_fun = DuckLakeFunctions::GetCopyFunction(context, data_file_format);
 	if (!copy_fun.function.copy_to_bind) {
-		// DuckLake's writer drives the copy_to_bind API; plan-based copy functions are not supported.
 		throw NotImplementedException(
 		    "The '%s' copy function cannot be used to write DuckLake data files (no copy_to_bind support)",
 		    data_file_format);
@@ -769,16 +767,7 @@ PhysicalOperator &DuckLakeInsert::PlanInsert(ClientContext &context, PhysicalPla
 	}
 	vector<LogicalType> return_types;
 	return_types.emplace_back(LogicalType::BIGINT);
-	// Resolve the configured data file format so the sink records it on the written files. This must
-	// match the format GetCopyOptions selects for the same table.
-	string data_file_format = "parquet";
-	auto &catalog = table.ParentCatalog().Cast<DuckLakeCatalog>();
-	catalog.TryGetConfigOption("data_file_format", data_file_format, table);
-	data_file_format = ValidateDataFileFormat(data_file_format);
-	auto &insert =
-	    planner.Make<DuckLakeInsert>(return_types, table, partition_id, std::move(encryption_key)).Cast<DuckLakeInsert>();
-	insert.file_format = std::move(data_file_format);
-	return insert;
+	return planner.Make<DuckLakeInsert>(return_types, table, partition_id, std::move(encryption_key));
 }
 
 string DuckLakeCatalog::GenerateEncryptionKey(ClientContext &context) const {

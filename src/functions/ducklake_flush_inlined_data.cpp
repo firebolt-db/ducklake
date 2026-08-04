@@ -739,7 +739,7 @@ static unique_ptr<LogicalOperator> FlushInlinedDataBind(ClientContext &context, 
 	auto projection = make_uniq<LogicalProjection>(bind_index, std::move(proj_exprs));
 	projection->children.push_back(std::move(filter));
 
-	return projection;
+	return unique_ptr<LogicalOperator>(projection.release());
 }
 
 DuckLakeFlushInlinedDataFunction::DuckLakeFlushInlinedDataFunction()
