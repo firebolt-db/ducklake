@@ -103,10 +103,12 @@ DuckLakeColumnStats DuckLakeInsert::ParseColumnStats(const LogicalType &type, co
 }
 
 void DuckLakeInsert::AddWrittenFiles(DuckLakeInsertGlobalState &global_state, DataChunk &chunk,
-                                     const string &encryption_key, optional_idx partition_id, bool set_snapshot_id) {
+                                     const string &encryption_key, optional_idx partition_id, bool set_snapshot_id,
+                                     const string &file_format) {
 	for (idx_t r = 0; r < chunk.size(); r++) {
 		DuckLakeDataFile data_file;
 		data_file.file_name = chunk.GetValue(0, r).GetValue<string>();
+		data_file.file_format = file_format;
 		data_file.row_count = chunk.GetValue(1, r).GetValue<idx_t>();
 		data_file.file_size_bytes = chunk.GetValue(2, r).GetValue<idx_t>();
 		data_file.footer_size = chunk.GetValue(3, r).GetValue<idx_t>();
@@ -211,7 +213,7 @@ void DuckLakeInsert::AddWrittenFiles(DuckLakeInsertGlobalState &global_state, Da
 
 SinkResultType DuckLakeInsert::Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const {
 	auto &global_state = input.global_state.Cast<DuckLakeInsertGlobalState>();
-	AddWrittenFiles(global_state, chunk, encryption_key, partition_id);
+	AddWrittenFiles(global_state, chunk, encryption_key, partition_id, false, file_format);
 	return SinkResultType::NEED_MORE_INPUT;
 }
 
@@ -482,50 +484,78 @@ static void GeneratePartitionExpressions(ClientContext &context, DuckLakeCopyInp
 	}
 }
 
+string DuckLakeInsert::ValidateDataFileFormat(string format) {
+	format = StringUtil::Lower(format);
+	// Formats DuckLake can write. Writing requires a COPY function that implements the copy_to_bind API
+	// (parquet and vortex do; e.g. json/csv use the newer plan-based COPY and cannot be written here).
+	// Any such file is read back via the generic format reader (read_<format>).
+	if (format != "parquet" && format != "vortex") {
+		throw InvalidInputException(
+		    "Unsupported data_file_format \"%s\" - DuckLake can write 'parquet' and 'vortex' data files", format);
+	}
+	return format;
+}
+
 DuckLakeCopyOptions DuckLakeInsert::GetCopyOptions(ClientContext &context, DuckLakeCopyInput &copy_input) {
 	auto info = make_uniq<CopyInfo>();
 	auto &catalog = copy_input.catalog;
+	auto &schema_id = copy_input.schema_id;
+	auto &table_id = copy_input.table_id;
 	info->file_path = copy_input.data_path;
-	info->format = "parquet";
 	info->is_from = false;
-	// generate the field ids to be written by the parquet writer
-	shared_ptr<DuckLakeFieldData> generated_ids;
-	if (!copy_input.field_data) {
-		// CTAS - generate new ids from columns
-		generated_ids = DuckLakeFieldData::FromColumns(copy_input.columns);
+
+	// Determine the physical file format for this table: parquet (default) or another supported format.
+	string data_file_format = "parquet";
+	catalog.TryGetConfigOption("data_file_format", data_file_format, schema_id, table_id);
+	data_file_format = ValidateDataFileFormat(data_file_format);
+	const bool is_parquet = data_file_format == "parquet";
+	info->format = data_file_format;
+
+	if (is_parquet) {
+		// generate the field ids to be written by the parquet writer. Non-parquet files are mapped by
+		// column name at read time, so field ids are not written for them.
+		shared_ptr<DuckLakeFieldData> generated_ids;
+		if (!copy_input.field_data) {
+			// CTAS - generate new ids from columns
+			generated_ids = DuckLakeFieldData::FromColumns(copy_input.columns);
+		}
+		auto &field_ids = copy_input.field_data ? *copy_input.field_data : *generated_ids;
+		vector<Value> field_input;
+		field_input.push_back(WrittenFieldIds(field_ids, copy_input.virtual_columns));
+		info->options["field_ids"] = std::move(field_input);
 	}
-	auto &field_ids = copy_input.field_data ? *copy_input.field_data : *generated_ids;
-	vector<Value> field_input;
-	field_input.push_back(WrittenFieldIds(field_ids, copy_input.virtual_columns));
-	info->options["field_ids"] = std::move(field_input);
 	if (!copy_input.encryption_key.empty()) {
+		if (!is_parquet) {
+			throw NotImplementedException("Encryption is only supported for DuckLake tables written as parquet");
+		}
 		child_list_t<Value> values;
 		values.emplace_back("footer_key_value", Value::BLOB_RAW(copy_input.encryption_key));
 		vector<Value> encryption_input;
 		encryption_input.push_back(Value::STRUCT(std::move(values)));
 		info->options["encryption_config"] = std::move(encryption_input);
 	}
-	auto &schema_id = copy_input.schema_id;
-	auto &table_id = copy_input.table_id;
-	string parquet_compression;
-	if (catalog.TryGetConfigOption("parquet_compression", parquet_compression, schema_id, table_id)) {
-		info->options["compression"].emplace_back(parquet_compression);
-	}
-	string parquet_version;
-	if (catalog.TryGetConfigOption("parquet_version", parquet_version, schema_id, table_id)) {
-		info->options["parquet_version"].emplace_back(parquet_version);
-	}
-	string parquet_compression_level;
-	if (catalog.TryGetConfigOption("parquet_compression_level", parquet_compression_level, schema_id, table_id)) {
-		info->options["compression_level"].emplace_back(parquet_compression_level);
-	}
-	string row_group_size;
-	if (catalog.TryGetConfigOption("parquet_row_group_size", row_group_size, schema_id, table_id)) {
-		info->options["row_group_size"].emplace_back(row_group_size);
-	}
-	string row_group_size_bytes;
-	if (catalog.TryGetConfigOption("parquet_row_group_size_bytes", row_group_size_bytes, schema_id, table_id)) {
-		info->options["row_group_size_bytes"].emplace_back(row_group_size_bytes + " bytes");
+	if (is_parquet) {
+		// The following options are parquet-writer specific.
+		string parquet_compression;
+		if (catalog.TryGetConfigOption("parquet_compression", parquet_compression, schema_id, table_id)) {
+			info->options["compression"].emplace_back(parquet_compression);
+		}
+		string parquet_version;
+		if (catalog.TryGetConfigOption("parquet_version", parquet_version, schema_id, table_id)) {
+			info->options["parquet_version"].emplace_back(parquet_version);
+		}
+		string parquet_compression_level;
+		if (catalog.TryGetConfigOption("parquet_compression_level", parquet_compression_level, schema_id, table_id)) {
+			info->options["compression_level"].emplace_back(parquet_compression_level);
+		}
+		string row_group_size;
+		if (catalog.TryGetConfigOption("parquet_row_group_size", row_group_size, schema_id, table_id)) {
+			info->options["row_group_size"].emplace_back(row_group_size);
+		}
+		string row_group_size_bytes;
+		if (catalog.TryGetConfigOption("parquet_row_group_size_bytes", row_group_size_bytes, schema_id, table_id)) {
+			info->options["row_group_size_bytes"].emplace_back(row_group_size_bytes + " bytes");
+		}
 	}
 	string per_thread_output_str;
 	bool per_thread_output = false;
@@ -535,11 +565,19 @@ DuckLakeCopyOptions DuckLakeInsert::GetCopyOptions(ClientContext &context, DuckL
 	idx_t target_file_size = catalog.GetConfigOption<idx_t>("target_file_size", schema_id, table_id,
 	                                                        DuckLakeCatalog::DEFAULT_TARGET_FILE_SIZE);
 
-	// Always use native parquet geometry for writing
-	info->options["geoparquet_version"].emplace_back("NONE");
+	if (is_parquet) {
+		// Always use native parquet geometry for writing
+		info->options["geoparquet_version"].emplace_back("NONE");
+	}
 
-	// Get Parquet Copy function
-	auto &copy_fun = DuckLakeFunctions::GetCopyFunction(context, "parquet");
+	// Get the copy function for the chosen data file format
+	auto &copy_fun = DuckLakeFunctions::GetCopyFunction(context, data_file_format);
+	if (!copy_fun.function.copy_to_bind) {
+		// DuckLake's writer drives the copy_to_bind API; plan-based copy functions are not supported.
+		throw NotImplementedException(
+		    "The '%s' copy function cannot be used to write DuckLake data files (no copy_to_bind support)",
+		    data_file_format);
+	}
 
 	auto &fs = FileSystem::GetFileSystem(context);
 	if (!fs.IsRemoteFile(copy_input.data_path)) {
@@ -594,7 +632,7 @@ DuckLakeCopyOptions DuckLakeInsert::GetCopyOptions(ClientContext &context, DuckL
 	}
 	result.file_path = copy_input.data_path;
 	StripTrailingSeparator(fs, result.file_path);
-	result.file_extension = "parquet";
+	result.file_extension = data_file_format;
 	result.overwrite_mode = CopyOverwriteMode::COPY_OVERWRITE_OR_IGNORE;
 	result.per_thread_output = per_thread_output;
 	result.write_partition_columns = true;
@@ -731,7 +769,16 @@ PhysicalOperator &DuckLakeInsert::PlanInsert(ClientContext &context, PhysicalPla
 	}
 	vector<LogicalType> return_types;
 	return_types.emplace_back(LogicalType::BIGINT);
-	return planner.Make<DuckLakeInsert>(return_types, table, partition_id, std::move(encryption_key));
+	// Resolve the configured data file format so the sink records it on the written files. This must
+	// match the format GetCopyOptions selects for the same table.
+	string data_file_format = "parquet";
+	auto &catalog = table.ParentCatalog().Cast<DuckLakeCatalog>();
+	catalog.TryGetConfigOption("data_file_format", data_file_format, table);
+	data_file_format = ValidateDataFileFormat(data_file_format);
+	auto &insert =
+	    planner.Make<DuckLakeInsert>(return_types, table, partition_id, std::move(encryption_key)).Cast<DuckLakeInsert>();
+	insert.file_format = std::move(data_file_format);
+	return insert;
 }
 
 string DuckLakeCatalog::GenerateEncryptionKey(ClientContext &context) const {

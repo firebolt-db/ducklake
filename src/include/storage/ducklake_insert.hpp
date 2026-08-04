@@ -63,6 +63,8 @@ public:
 	optional_idx partition_id;
 	//! The encryption key used for writing the Parquet files
 	string encryption_key;
+	//! The physical format written data files are stored in ("parquet", "vortex", ...)
+	string file_format = "parquet";
 
 public:
 	// // Source interface
@@ -78,13 +80,16 @@ public:
 	static unique_ptr<LogicalOperator> InsertCasts(Binder &binder, unique_ptr<LogicalOperator> &plan);
 
 	static DuckLakeColumnStats ParseColumnStats(const LogicalType &type, const vector<Value> &stats);
+	//! Normalize and validate a configured data file format; throws for unsupported formats.
+	static string ValidateDataFileFormat(string format);
 	static DuckLakeCopyOptions GetCopyOptions(ClientContext &context, DuckLakeCopyInput &copy_input);
 	static PhysicalOperator &PlanCopyForInsert(ClientContext &context, PhysicalPlanGenerator &planner,
 	                                           DuckLakeCopyInput &copy_input, optional_ptr<PhysicalOperator> plan);
 	static PhysicalOperator &PlanInsert(ClientContext &context, PhysicalPlanGenerator &planner,
 	                                    DuckLakeTableEntry &table, string encryption_key);
 	static void AddWrittenFiles(DuckLakeInsertGlobalState &gstate, DataChunk &chunk, const string &encryption_key,
-	                            optional_idx partition_id, bool set_snapshot_id = false);
+	                            optional_idx partition_id, bool set_snapshot_id = false,
+	                            const string &file_format = "parquet");
 
 	static const DuckLakeFieldId &GetTopLevelColumn(DuckLakeCopyInput &copy_input, FieldIndex field_id,
 	                                                optional_idx &index);

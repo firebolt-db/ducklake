@@ -1,4 +1,4 @@
-#include "storage/ducklake_vortex_reader.hpp"
+#include "storage/ducklake_format_reader.hpp"
 #include "storage/ducklake_multi_file_reader.hpp"
 #include "storage/ducklake_scan.hpp"
 #include "storage/ducklake_delete_filter.hpp"
@@ -7,32 +7,36 @@
 #include "duckdb/main/extension_helper.hpp"
 #include "duckdb/parser/tableref/table_function_ref.hpp"
 #include "duckdb/planner/table_filter_state.hpp"
+#include "duckdb/planner/filter/expression_filter.hpp"
 #include "duckdb/storage/table/column_segment.hpp"
 #include "duckdb/common/vector_operations/vector_operations.hpp"
 
 namespace duckdb {
 
-DuckLakeVortexReader::DuckLakeVortexReader(DuckLakeFunctionInfo &read_info, const OpenFileInfo &info,
+DuckLakeFormatReader::DuckLakeFormatReader(DuckLakeFunctionInfo &read_info, const OpenFileInfo &info, string format_p,
                                            vector<MultiFileColumnDefinition> columns_p)
-    : BaseFileReader(info), read_info(read_info) {
+    : BaseFileReader(info), read_info(read_info), format(std::move(format_p)) {
 	columns = std::move(columns_p);
 }
 
-TableFunction DuckLakeVortexReader::GetReadVortexFunction(ClientContext &context) {
+TableFunction DuckLakeFormatReader::GetReadFunction(ClientContext &context, const string &format) {
 	auto &instance = DatabaseInstance::GetDatabase(context);
-	// The vortex extension registers read_vortex on load; auto-load it if it is available.
-	ExtensionHelper::TryAutoLoadExtension(instance, "vortex");
+	// The extension registering read_<format> may need to be auto-loaded (no-op for core formats).
+	ExtensionHelper::TryAutoLoadExtension(instance, format);
 	ExtensionLoader loader(instance, "ducklake");
-	auto entry = loader.TryGetTableFunction("read_vortex");
+	auto function_name = "read_" + format;
+	auto entry = loader.TryGetTableFunction(Identifier(function_name));
 	if (!entry) {
-		throw MissingExtensionException("Reading DuckLake data files stored in the 'vortex' format requires the "
-		                                "\"vortex\" extension to be installed and loaded");
+		throw MissingExtensionException(
+		    "Reading DuckLake data files in the '%s' format requires the '%s' table function to be available "
+		    "(install/load the extension providing it)",
+		    format, function_name);
 	}
-	auto &vortex_scan_entry = entry->Cast<TableFunctionCatalogEntry>();
-	return vortex_scan_entry.functions.GetFunctionByOffset(0);
+	auto &scan_entry = entry->Cast<TableFunctionCatalogEntry>();
+	return scan_entry.functions.GetFunctionByOffset(0);
 }
 
-bool DuckLakeVortexReader::TryInitializeScan(ClientContext &context, GlobalTableFunctionState &gstate,
+bool DuckLakeFormatReader::TryInitializeScan(ClientContext &context, GlobalTableFunctionState &gstate,
                                              LocalTableFunctionState &lstate) {
 	{
 		// only one thread reads a given file
@@ -43,8 +47,8 @@ bool DuckLakeVortexReader::TryInitializeScan(ClientContext &context, GlobalTable
 		initialized_scan = true;
 	}
 
-	// Bind read_vortex on the physical file to discover its schema.
-	vortex_scan = GetReadVortexFunction(context);
+	// Bind read_<format> on the physical file to discover its schema.
+	file_scan = GetReadFunction(context, format);
 
 	vector<Value> children;
 	children.push_back(Value(file.path));
@@ -52,14 +56,20 @@ bool DuckLakeVortexReader::TryInitializeScan(ClientContext &context, GlobalTable
 	vector<LogicalType> input_types;
 	vector<Identifier> input_names;
 
+	// Some read functions require schema auto-detection to be requested explicitly when bound
+	// programmatically (the SQL wrappers enable it by default). read_json is one such case.
+	if (StringUtil::CIEquals(format, "json")) {
+		named_params["auto_detect"] = Value::BOOLEAN(true);
+	}
+
 	TableFunctionRef empty;
 	TableFunction dummy_table_function;
-	dummy_table_function.SetName("DuckLakeVortexReader");
+	dummy_table_function.SetName("DuckLakeFormatReader");
 	TableFunctionBindInput bind_input(children, named_params, input_types, input_names, nullptr, nullptr,
 	                                  dummy_table_function, empty);
-	bind_data = vortex_scan.bind(context, bind_input, file_types, file_names);
+	bind_data = file_scan.bind(context, bind_input, file_types, file_names);
 
-	// Build the projection into the vortex file and the mapping to the reader's output columns.
+	// Build the projection into the file and the mapping to the reader's output columns.
 	vector<LogicalType> scan_types;
 	for (auto &column_id : column_indexes) {
 		auto index = column_id.GetPrimaryIndex();
@@ -69,11 +79,11 @@ bool DuckLakeVortexReader::TryInitializeScan(ClientContext &context, GlobalTable
 		// the MultiFileReader as expressions on top of the ordinal.
 		if (!col.identifier.IsNull() && col.identifier.type().id() == LogicalTypeId::INTEGER &&
 		    IntegerValue::Get(col.identifier) == MultiFileReader::ORDINAL_FIELD_ID) {
-			output_kinds.push_back(VortexReaderColumn::ORDINAL);
+			output_kinds.push_back(FormatReaderColumn::ORDINAL);
 			output_source_index.push_back(0);
 			continue;
 		}
-		// Regular column - locate it in the vortex file by name.
+		// Regular column - locate it in the file by name.
 		auto column_name = col.name.GetIdentifierName();
 		optional_idx file_position;
 		for (idx_t i = 0; i < file_names.size(); i++) {
@@ -84,17 +94,17 @@ bool DuckLakeVortexReader::TryInitializeScan(ClientContext &context, GlobalTable
 		}
 		if (!file_position.IsValid()) {
 			// column is not present in this file - emit its default (NULL)
-			output_kinds.push_back(VortexReaderColumn::MISSING);
+			output_kinds.push_back(FormatReaderColumn::MISSING);
 			output_source_index.push_back(0);
 			continue;
 		}
-		output_kinds.push_back(VortexReaderColumn::FILE_COLUMN);
+		output_kinds.push_back(FormatReaderColumn::FILE_COLUMN);
 		output_source_index.push_back(scan_column_ids.size());
 		scan_column_ids.push_back(file_position.GetIndex());
 		scan_types.push_back(file_types[file_position.GetIndex()]);
 	}
 
-	// read_vortex needs at least one projected column to determine the cardinality of each chunk.
+	// read_<format> needs at least one projected column to determine the cardinality of each chunk.
 	if (scan_column_ids.empty() && !file_types.empty()) {
 		scan_column_ids.push_back(0);
 		scan_types.push_back(file_types[0]);
@@ -104,16 +114,16 @@ bool DuckLakeVortexReader::TryInitializeScan(ClientContext &context, GlobalTable
 	thread_context = make_uniq<ThreadContext>(context);
 	execution_context = make_uniq<ExecutionContext>(context, *thread_context, nullptr);
 	TableFunctionInitInput init_input(bind_data.get(), scan_column_ids, vector<idx_t>(), nullptr);
-	global_state = vortex_scan.init_global(context, init_input);
-	local_state = vortex_scan.init_local(*execution_context, init_input, global_state.get());
+	global_state = file_scan.init_global(context, init_input);
+	local_state = file_scan.init_local(*execution_context, init_input, global_state.get());
 	return true;
 }
 
-AsyncResult DuckLakeVortexReader::Scan(ClientContext &context, GlobalTableFunctionState &global_table_state,
+AsyncResult DuckLakeFormatReader::Scan(ClientContext &context, GlobalTableFunctionState &global_table_state,
                                        LocalTableFunctionState &local_table_state, DataChunk &chunk) {
 	scan_chunk.Reset();
 	TableFunctionInput function_input(bind_data.get(), local_state.get(), global_state.get());
-	vortex_scan.function(context, function_input, scan_chunk);
+	file_scan.function(context, function_input, scan_chunk);
 	idx_t scan_count = scan_chunk.size();
 	if (scan_count == 0) {
 		return AsyncResult(SourceResultType::FINISHED);
@@ -121,7 +131,7 @@ AsyncResult DuckLakeVortexReader::Scan(ClientContext &context, GlobalTableFuncti
 
 	for (idx_t c = 0; c < output_kinds.size(); c++) {
 		switch (output_kinds[c]) {
-		case VortexReaderColumn::FILE_COLUMN: {
+		case FormatReaderColumn::FILE_COLUMN: {
 			auto &source = scan_chunk.data[output_source_index[c]];
 			if (chunk.data[c].GetType() != source.GetType()) {
 				VectorOperations::Cast(context, source, chunk.data[c], scan_count);
@@ -130,14 +140,14 @@ AsyncResult DuckLakeVortexReader::Scan(ClientContext &context, GlobalTableFuncti
 			}
 			break;
 		}
-		case VortexReaderColumn::ORDINAL: {
+		case FormatReaderColumn::ORDINAL: {
 			auto ordinal_data = FlatVector::GetDataMutable<int64_t>(chunk.data[c]);
 			for (idx_t r = 0; r < scan_count; r++) {
 				ordinal_data[r] = file_row_number + NumericCast<int64_t>(r);
 			}
 			break;
 		}
-		case VortexReaderColumn::MISSING:
+		case FormatReaderColumn::MISSING:
 			chunk.data[c].SetVectorType(VectorType::CONSTANT_VECTOR);
 			ConstantVector::SetNull(chunk.data[c], true);
 			break;
@@ -176,16 +186,16 @@ AsyncResult DuckLakeVortexReader::Scan(ClientContext &context, GlobalTableFuncti
 	return AsyncResult(SourceResultType::HAVE_MORE_OUTPUT);
 }
 
-void DuckLakeVortexReader::AddVirtualColumn(column_t virtual_column_id) {
+void DuckLakeFormatReader::AddVirtualColumn(column_t virtual_column_id) {
 	if (virtual_column_id == MultiFileReader::COLUMN_IDENTIFIER_FILE_ROW_NUMBER) {
 		columns.back().identifier = Value::INTEGER(MultiFileReader::ORDINAL_FIELD_ID);
 	} else {
-		throw InternalException("Unsupported virtual column id %d for vortex reader", virtual_column_id);
+		throw InternalException("Unsupported virtual column id %d for format reader", virtual_column_id);
 	}
 }
 
-string DuckLakeVortexReader::GetReaderType() const {
-	return "DuckLake Vortex";
+string DuckLakeFormatReader::GetReaderType() const {
+	return "DuckLake " + format;
 }
 
 } // namespace duckdb

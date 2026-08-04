@@ -62,6 +62,9 @@ struct DuckLakeDataFile {
 	DuckLakeDataFile &operator=(const DuckLakeDataFile &);
 
 	string file_name;
+	//! The physical format the file is stored in ("parquet", "vortex", ...). Recorded in
+	//! ducklake_data_file.file_format and used to pick the reader at scan time.
+	string file_format = "parquet";
 	idx_t row_count;
 	idx_t file_size_bytes;
 	optional_idx footer_size;

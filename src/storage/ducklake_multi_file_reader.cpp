@@ -1,6 +1,6 @@
 #include "storage/ducklake_multi_file_list.hpp"
 #include "storage/ducklake_multi_file_reader.hpp"
-#include "storage/ducklake_vortex_reader.hpp"
+#include "storage/ducklake_format_reader.hpp"
 #include "storage/ducklake_table_entry.hpp"
 #include "storage/ducklake_catalog.hpp"
 #include "storage/ducklake_delete_filter.hpp"
@@ -387,7 +387,7 @@ shared_ptr<BaseFileReader> DuckLakeMultiFileReader::TryCreateInlinedDataReader(c
 	                                                  std::move(columns));
 }
 
-shared_ptr<BaseFileReader> DuckLakeMultiFileReader::TryCreateVortexReader(ClientContext &context,
+shared_ptr<BaseFileReader> DuckLakeMultiFileReader::TryCreateFormatReader(ClientContext &context,
                                                                          const OpenFileInfo &file) {
 	if (!file.extended_info) {
 		return nullptr;
@@ -397,12 +397,15 @@ shared_ptr<BaseFileReader> DuckLakeMultiFileReader::TryCreateVortexReader(Client
 		// no format recorded - default parquet path
 		return nullptr;
 	}
-	if (!StringUtil::CIEquals(StringValue::Get(entry->second), "vortex")) {
+	auto format = StringUtil::Lower(StringValue::Get(entry->second));
+	if (format.empty() || format == "parquet") {
+		// parquet is read by the native parquet reader path
 		return nullptr;
 	}
-	// Map the vortex file's columns onto the table's current field ids by name.
+	// Non-parquet format: map the file's columns onto the table's current field ids by name and read it
+	// via the format's read_<format> table function.
 	auto columns = DuckLakeMultiFileReader::ColumnsFromFieldData(read_info.table.GetFieldData(), true);
-	return make_shared_ptr<DuckLakeVortexReader>(read_info, file, std::move(columns));
+	return make_shared_ptr<DuckLakeFormatReader>(read_info, file, std::move(format), std::move(columns));
 }
 
 shared_ptr<BaseFileReader> DuckLakeMultiFileReader::CreateReader(ClientContext &context,
@@ -413,7 +416,7 @@ shared_ptr<BaseFileReader> DuckLakeMultiFileReader::CreateReader(ClientContext &
 	if (reader) {
 		return reader;
 	}
-	reader = TryCreateVortexReader(context, file);
+	reader = TryCreateFormatReader(context, file);
 	if (reader) {
 		return reader;
 	}
@@ -428,7 +431,7 @@ shared_ptr<BaseFileReader> DuckLakeMultiFileReader::CreateReader(ClientContext &
 	if (reader) {
 		return reader;
 	}
-	reader = TryCreateVortexReader(context, file);
+	reader = TryCreateFormatReader(context, file);
 	if (reader) {
 		return reader;
 	}

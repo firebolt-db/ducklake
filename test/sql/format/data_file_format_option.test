@@ -1,0 +1,45 @@
+# name: test/sql/format/data_file_format_option.test
+# description: data_file_format option validation and file_format metadata recording
+# group: [format]
+
+require ducklake
+
+require parquet
+
+statement ok
+ATTACH 'ducklake:{TEST_DIR}/dl_fmt.db' AS ducklake (DATA_PATH '{TEST_DIR}/dl_fmt_files', METADATA_CATALOG 'ducklake_meta')
+
+# write every insert to a data file (no metadata inlining) so file_format is exercised
+statement ok
+CALL ducklake.set_option('data_inlining_row_limit', 0)
+
+# default format is parquet, now explicitly recorded in the file_format column
+statement ok
+CREATE TABLE ducklake.t(i INTEGER, j INTEGER);
+
+statement ok
+INSERT INTO ducklake.t VALUES (1, 2), (3, 4);
+
+query I
+SELECT DISTINCT file_format FROM ducklake_meta.ducklake_data_file
+----
+parquet
+
+# setting it explicitly to parquet is accepted
+statement ok
+CALL ducklake.set_option('data_file_format', 'parquet')
+
+# case-insensitive value
+statement ok
+CALL ducklake.set_option('data_file_format', 'PARQUET')
+
+# unsupported formats are rejected at set time
+statement error
+CALL ducklake.set_option('data_file_format', 'orc')
+----
+Unsupported data_file_format
+
+statement error
+CALL ducklake.set_option('data_file_format', 'avro')
+----
+Unsupported data_file_format
