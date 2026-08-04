@@ -1926,6 +1926,7 @@ DuckLakeFileInfo DuckLakeTransaction::GetNewDataFile(const DuckLakeDataFile &fil
 	data_file.id = DataFileIndex(commit_snapshot.next_file_id++);
 	data_file.table_id = table_id;
 	data_file.file_name = file.file_name;
+	data_file.file_format = file.file_format;
 	data_file.row_count = file.row_count;
 	data_file.file_size_bytes = file.file_size_bytes;
 	data_file.footer_size = file.footer_size;
@@ -2601,7 +2602,7 @@ unique_ptr<QueryResult> DuckLakeTransaction::Query(string query) {
 	if (cb) {
 		cb(query, end - start);
 	}
-	return result;
+	return unique_ptr<QueryResult>(result.release());
 }
 
 unique_ptr<QueryResult> DuckLakeTransaction::Query(DuckLakeSnapshot snapshot, string query) {

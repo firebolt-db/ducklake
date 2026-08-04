@@ -6,3 +6,6 @@
 	path = extension-ci-tools
 	url = https://github.com/duckdb/extension-ci-tools
 	branch = main
+[submodule "vortex"]
+	path = vortex
+	url = https://github.com/vortex-data/duckdb-vortex.git

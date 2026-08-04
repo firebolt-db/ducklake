@@ -1,0 +1,62 @@
+# name: test/sql/vortex/vortex_name_map.test
+# description: the format reader resolves renamed columns via the file's mapping_id (name map)
+# group: [vortex]
+#
+# After a column rename, a non-parquet file keeps its original physical column names. DuckLake records
+# a name map (mapping_id) mapping the new field ids to those physical names. The format reader must look
+# columns up by physical name, not by the current schema name.
+
+require ducklake
+
+require parquet
+
+require vortex
+
+statement ok
+ATTACH 'ducklake:{TEST_DIR}/dl_nm.db' AS ducklake (DATA_PATH '{TEST_DIR}/dl_nm_files', METADATA_CATALOG 'ducklake_meta')
+
+statement ok
+CALL ducklake.set_option('data_inlining_row_limit', 0)
+
+statement ok
+CREATE TABLE ducklake.t(i INTEGER, s VARCHAR)
+
+statement ok
+INSERT INTO ducklake.t VALUES (1, 'a'), (2, 'bb'), (3, 'ccc')
+
+# write a vortex file with physical column names i, s and register it
+statement ok
+COPY (SELECT i, s FROM ducklake.t ORDER BY i) TO '{TEST_DIR}/nm.vortex' (FORMAT vortex)
+
+statement ok
+UPDATE ducklake_meta.ducklake_data_file
+SET path = '{TEST_DIR}/nm.vortex', path_is_relative = false, file_format = 'vortex'
+WHERE end_snapshot IS NULL
+
+# rename s -> s2: the file still has physical name 's'
+statement ok
+ALTER TABLE ducklake.t RENAME COLUMN s TO s2
+
+# register a name map for the file: field id 2 (s2) -> physical name 's'
+statement ok
+INSERT INTO ducklake_meta.ducklake_column_mapping VALUES (100, 1, 'map_by_name')
+
+statement ok
+INSERT INTO ducklake_meta.ducklake_name_mapping VALUES (100, 1, 'i', 1, NULL, false), (100, 2, 's', 2, NULL, false)
+
+statement ok
+UPDATE ducklake_meta.ducklake_data_file SET mapping_id = 100 WHERE end_snapshot IS NULL
+
+statement ok
+DETACH ducklake
+
+statement ok
+ATTACH 'ducklake:{TEST_DIR}/dl_nm.db' AS ducklake (DATA_PATH '{TEST_DIR}/dl_nm_files', METADATA_CATALOG 'ducklake_meta')
+
+# the renamed column resolves to the physical name in the vortex file (would be NULL without the fix)
+query IT
+SELECT i, s2 FROM ducklake.t ORDER BY i
+----
+1	a
+2	bb
+3	ccc

@@ -37,6 +37,8 @@ public:
 	case_insensitive_set_t not_null_fields;
 	//! Total rows flushed (used by flush_inlined_data)
 	idx_t rows_flushed = 0;
+	//! Format written files are recorded with (resolved from the table's data_file_format option)
+	string file_format = "parquet";
 };
 
 class DuckLakeInsert : public PhysicalOperator {
@@ -78,6 +80,8 @@ public:
 	static unique_ptr<LogicalOperator> InsertCasts(Binder &binder, unique_ptr<LogicalOperator> &plan);
 
 	static DuckLakeColumnStats ParseColumnStats(const LogicalType &type, const vector<Value> &stats);
+	//! Normalize and validate a configured data file format; throws for unsupported formats.
+	static string ValidateDataFileFormat(string format);
 	static DuckLakeCopyOptions GetCopyOptions(ClientContext &context, DuckLakeCopyInput &copy_input);
 	static PhysicalOperator &PlanCopyForInsert(ClientContext &context, PhysicalPlanGenerator &planner,
 	                                           DuckLakeCopyInput &copy_input, optional_ptr<PhysicalOperator> plan);

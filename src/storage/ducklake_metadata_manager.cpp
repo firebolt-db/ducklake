@@ -873,7 +873,7 @@ ORDER BY table_id;
 	return TransformGlobalStats(*result);
 }
 
-string DuckLakeMetadataManager::GetFileSelectList(const string &prefix) {
+string DuckLakeMetadataManager::GetFileSelectList(const string &prefix, bool include_data_file_format) {
 	static const vector<string> column_list {
 	    "path", "path_is_relative", "file_size_bytes", "footer_size", "encryption_key",
 	};
@@ -887,6 +887,12 @@ string DuckLakeMetadataManager::GetFileSelectList(const string &prefix) {
 		return prefix + "." + column + " AS " + prefix + "_" + column;
 	});
 
+	if (include_data_file_format) {
+		// trailing column, read right after ReadDataFile's fixed ones (data files only; delete files
+		// have no file_format column)
+		result += ", " + prefix + ".file_format AS " + prefix + "_file_format";
+	}
+
 	return result;
 }
 
@@ -896,12 +902,15 @@ string DuckLakeMetadataManager::GetDeleteFileSelectList(const string &prefix) {
 
 template <class T>
 DuckLakeFileData DuckLakeMetadataManager::ReadDataFile(DuckLakeTableEntry &table, T &row, idx_t &col_idx,
-                                                       bool is_encrypted) {
+                                                       bool is_encrypted, bool read_data_file_format) {
 	DuckLakeFileData data;
 	if (row.IsNull(col_idx)) {
 		// file is not there
 		col_idx += 4;
 		if (is_encrypted) {
+			col_idx++;
+		}
+		if (read_data_file_format) {
 			col_idx++;
 		}
 		return data;
@@ -922,6 +931,12 @@ DuckLakeFileData DuckLakeMetadataManager::ReadDataFile(DuckLakeTableEntry &table
 			                            data.path);
 		}
 		data.encryption_key = Blob::FromBase64(row.template GetValue<string>(col_idx++));
+	}
+	if (read_data_file_format) {
+		if (!row.IsNull(col_idx)) {
+			data.data_file_format = row.template GetValue<string>(col_idx);
+		}
+		col_idx++;
 	}
 	return data;
 }
@@ -1370,7 +1385,7 @@ vector<DuckLakeFileListEntry> DuckLakeMetadataManager::GetFilesForTable(DuckLake
 		}
 	}
 
-	string select_list = "data.data_file_id, " + GetFileSelectList("data") +
+	string select_list = "data.data_file_id, " + GetFileSelectList("data", true) +
 	                     ", data.row_id_start, data.begin_snapshot, data.partial_max, data.mapping_id, " +
 	                     GetDeleteFileSelectList("del") + stats_select_list;
 
@@ -1418,7 +1433,7 @@ WHERE data.table_id=%d AND {SNAPSHOT_ID} >= data.begin_snapshot AND ({SNAPSHOT_I
 		DuckLakeFileListEntry file_entry;
 		idx_t col_idx = 0;
 		file_entry.file_id = DataFileIndex(row.GetValue<idx_t>(col_idx++));
-		file_entry.file = ReadDataFile(table, row, col_idx, IsEncrypted());
+		file_entry.file = ReadDataFile(table, row, col_idx, IsEncrypted(), true);
 		if (!row.IsNull(col_idx)) {
 			file_entry.row_id_start = row.GetValue<idx_t>(col_idx);
 		}
@@ -1464,7 +1479,7 @@ vector<DuckLakeFileListEntry> DuckLakeMetadataManager::GetTableInsertions(DuckLa
                                                                           DuckLakeSnapshot start_snapshot,
                                                                           DuckLakeSnapshot end_snapshot) {
 	auto table_id = table.GetTableId();
-	string select_list = GetFileSelectList("data") +
+	string select_list = GetFileSelectList("data", true) +
 	                     ", data.row_id_start, data.begin_snapshot, data.partial_max, data.mapping_id, " +
 	                     GetDeleteFileSelectList("del");
 	// Files either match the exact snapshot range
@@ -1497,7 +1512,7 @@ WHERE data.table_id=%d AND data.begin_snapshot <= {SNAPSHOT_ID} AND (
 	for (auto &row : *result) {
 		DuckLakeFileListEntry file_entry;
 		idx_t col_idx = 0;
-		file_entry.file = ReadDataFile(table, row, col_idx, IsEncrypted());
+		file_entry.file = ReadDataFile(table, row, col_idx, IsEncrypted(), true);
 		if (!row.IsNull(col_idx)) {
 			file_entry.row_id_start = row.GetValue<idx_t>(col_idx);
 		}
@@ -1529,7 +1544,7 @@ vector<DuckLakeDeleteScanEntry> DuckLakeMetadataManager::GetTableDeletions(DuckL
                                                                            DuckLakeSnapshot start_snapshot,
                                                                            DuckLakeSnapshot end_snapshot) {
 	auto table_id = table.GetTableId();
-	string select_list = "data.data_file_id, " + GetFileSelectList("data") +
+	string select_list = "data.data_file_id, " + GetFileSelectList("data", true) +
 	                     ", data.row_id_start, data.record_count, data.mapping_id, " +
 	                     GetDeleteFileSelectList("current_delete") + ", " + GetDeleteFileSelectList("previous_delete");
 
@@ -1640,7 +1655,7 @@ WHERE data.table_id = %d
   )
   AND (data.end_snapshot IS NULL OR data.end_snapshot < %d OR data.end_snapshot > {SNAPSHOT_ID})
 )",
-		                            GetFileSelectList("data"), null_file_cols, null_file_cols, table_id.index,
+		                            GetFileSelectList("data", true), null_file_cols, null_file_cols, table_id.index,
 		                            table_id.index, start_snapshot.snapshot_id);
 	}
 
@@ -1672,7 +1687,7 @@ FROM main_results
 		idx_t col_idx = 0;
 		auto file_id = row.GetValue<idx_t>(col_idx++);
 		entry.file_id = DataFileIndex(file_id);
-		entry.file = ReadDataFile(table, row, col_idx, IsEncrypted());
+		entry.file = ReadDataFile(table, row, col_idx, IsEncrypted(), true);
 		if (!row.IsNull(col_idx)) {
 			entry.row_id_start = row.GetValue<idx_t>(col_idx);
 		}
@@ -1712,7 +1727,7 @@ DuckLakeMetadataManager::GetExtendedFilesForTable(DuckLakeTableEntry &table, Duc
                                                   const FilterPushdownInfo *filter_info) {
 	auto table_id = table.GetTableId();
 	string select_list =
-	    GetFileSelectList("data") + ", data.row_id_start, " + GetDeleteFileSelectList("del") + ", del.begin_snapshot";
+	    GetFileSelectList("data", true) + ", data.row_id_start, " + GetDeleteFileSelectList("del") + ", del.begin_snapshot";
 
 	string query;
 	string where_clause;
@@ -1756,7 +1771,7 @@ WHERE data.table_id=%d AND {SNAPSHOT_ID} >= data.begin_snapshot AND ({SNAPSHOT_I
 		}
 		file_entry.row_count = row.GetValue<idx_t>(2);
 		idx_t col_idx = 3;
-		file_entry.file = ReadDataFile(table, row, col_idx, IsEncrypted());
+		file_entry.file = ReadDataFile(table, row, col_idx, IsEncrypted(), true);
 		if (!row.IsNull(col_idx)) {
 			file_entry.row_id_start = row.GetValue<idx_t>(col_idx);
 		}
@@ -1783,7 +1798,7 @@ vector<DuckLakeCompactionFileEntry> DuckLakeMetadataManager::GetFilesForCompacti
 	string data_select_list = "data.data_file_id, data.record_count, data.row_id_start, data.begin_snapshot, "
 	                          "data.end_snapshot, data.mapping_id, sr.schema_version , data.partial_max, "
 	                          "data.partition_id, partition_info.keys, " +
-	                          GetFileSelectList("data");
+	                          GetFileSelectList("data", true);
 	string delete_select_list = "del.data_file_id AS del_data_file_id,"
 	                            "del.delete_file_id AS del_delete_file_id, "
 	                            "del.delete_count, "
@@ -1875,7 +1890,7 @@ ORDER BY data.begin_snapshot, data.row_id_start, data.data_file_id, del.begin_sn
 			}
 		}
 		col_idx++;
-		new_entry.file.data = ReadDataFile(table, row, col_idx, IsEncrypted());
+		new_entry.file.data = ReadDataFile(table, row, col_idx, IsEncrypted(), true);
 		if (files.empty() || files.back().file.id != new_entry.file.id) {
 			// new file - push it into the file list
 			files.push_back(std::move(new_entry));
@@ -2942,7 +2957,7 @@ string DuckLakeMetadataManager::WriteNewDataFilesWithAppender(DuckLakeSnapshot &
 		data_file_appender.Append(Value());                                             // file_order (NULL)
 		data_file_appender.Append<string_t>(string_t(path.path));                       // path
 		data_file_appender.Append<bool>(path.path_is_relative);                         // path_is_relative
-		data_file_appender.Append<string_t>(string_t("parquet"));                       // file_format
+		data_file_appender.Append<string_t>(string_t(file.file_format));                // file_format
 		data_file_appender.Append<int64_t>(static_cast<int64_t>(file.row_count));       // record_count
 		data_file_appender.Append<int64_t>(static_cast<int64_t>(file.file_size_bytes)); // file_size_bytes
 		if (file.footer_size.IsValid()) {
@@ -3159,9 +3174,9 @@ string DuckLakeMetadataManager::WriteNewDataFiles(DuckLakeSnapshot &commit_snaps
 		string mapping = file.mapping_id.IsValid() ? to_string(file.mapping_id.index) : "NULL";
 		auto path = GetRelativePath(file.table_id, file.file_name, new_tables, new_schemas_result);
 		data_file_insert_query += StringUtil::Format(
-		    "(%d, %d, %s, NULL, NULL, %s, %s, 'parquet', %d, %d, %s, %s, %s, %s, %s, %s)", data_file_index, table_id,
-		    begin_snapshot, SQLString(path.path), path.path_is_relative ? "true" : "false", file.row_count,
-		    file.file_size_bytes, footer_size, row_id, partition_id, encryption_key, mapping, partial_max);
+		    "(%d, %d, %s, NULL, NULL, %s, %s, %s, %d, %d, %s, %s, %s, %s, %s, %s)", data_file_index, table_id,
+		    begin_snapshot, SQLString(path.path), path.path_is_relative ? "true" : "false", SQLString(file.file_format),
+		    file.row_count, file.file_size_bytes, footer_size, row_id, partition_id, encryption_key, mapping, partial_max);
 		for (auto &raw_stats : file.column_stats) {
 			// Stringify stats to construct insert queries
 			auto column_stats = DuckLakeColumnStatsInfo::FromColumnStats(raw_stats.first, raw_stats.second);

@@ -1,5 +1,6 @@
 #include "storage/ducklake_multi_file_list.hpp"
 #include "storage/ducklake_multi_file_reader.hpp"
+#include "storage/ducklake_format_reader.hpp"
 #include "storage/ducklake_table_entry.hpp"
 #include "storage/ducklake_catalog.hpp"
 #include "storage/ducklake_delete_filter.hpp"
@@ -386,11 +387,53 @@ shared_ptr<BaseFileReader> DuckLakeMultiFileReader::TryCreateInlinedDataReader(c
 	                                                  std::move(columns));
 }
 
+shared_ptr<BaseFileReader> DuckLakeMultiFileReader::TryCreateFormatReader(ClientContext &context,
+                                                                         const OpenFileInfo &file) {
+	if (!file.extended_info) {
+		return nullptr;
+	}
+	auto entry = file.extended_info->options.find("file_format");
+	if (entry == file.extended_info->options.end()) {
+		return nullptr;
+	}
+	auto format = StringUtil::Lower(StringValue::Get(entry->second));
+	if (format.empty() || format == "parquet") {
+		// parquet uses the native reader path
+		return nullptr;
+	}
+	auto columns = DuckLakeMultiFileReader::ColumnsFromFieldData(read_info.table.GetFieldData(), true);
+	// if the file has a name map (e.g. columns were renamed after it was written), look columns up by
+	// their physical name in the file instead of the current schema name
+	auto mapping_entry = file.extended_info->options.find("mapping_id");
+	if (mapping_entry != file.extended_info->options.end()) {
+		auto mapping_id = MappingIndex(mapping_entry->second.GetValue<idx_t>());
+		auto &name_map = read_info.GetTransaction()->GetMappingById(mapping_id);
+		unordered_map<idx_t, string> physical_names;
+		for (auto &column_map : name_map.column_maps) {
+			physical_names[column_map->target_field_id.index] = column_map->source_name;
+		}
+		for (auto &col : columns) {
+			if (col.identifier.IsNull() || col.identifier.type().id() != LogicalTypeId::INTEGER) {
+				continue;
+			}
+			auto name_entry = physical_names.find(IntegerValue::Get(col.identifier));
+			if (name_entry != physical_names.end()) {
+				col.name = name_entry->second;
+			}
+		}
+	}
+	return make_shared_ptr<DuckLakeFormatReader>(read_info, file, std::move(format), std::move(columns));
+}
+
 shared_ptr<BaseFileReader> DuckLakeMultiFileReader::CreateReader(ClientContext &context,
                                                                  GlobalTableFunctionState &gstate,
                                                                  const OpenFileInfo &file, idx_t file_idx,
                                                                  const MultiFileBindData &bind_data) {
 	auto reader = TryCreateInlinedDataReader(file);
+	if (reader) {
+		return reader;
+	}
+	reader = TryCreateFormatReader(context, file);
 	if (reader) {
 		return reader;
 	}
@@ -402,6 +445,10 @@ shared_ptr<BaseFileReader> DuckLakeMultiFileReader::CreateReader(ClientContext &
                                                                  const MultiFileOptions &file_options,
                                                                  MultiFileReaderInterface &interface) {
 	auto reader = TryCreateInlinedDataReader(file);
+	if (reader) {
+		return reader;
+	}
+	reader = TryCreateFormatReader(context, file);
 	if (reader) {
 		return reader;
 	}

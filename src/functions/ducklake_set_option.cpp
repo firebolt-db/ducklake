@@ -3,6 +3,7 @@
 #include "storage/ducklake_catalog.hpp"
 #include "storage/ducklake_table_entry.hpp"
 #include "storage/ducklake_schema_entry.hpp"
+#include "storage/ducklake_insert.hpp"
 
 namespace duckdb {
 
@@ -98,6 +99,9 @@ static unique_ptr<FunctionData> DuckLakeSetOptionBind(ClientContext &context, Ta
 		value = val.CastAs(context, LogicalType::BOOLEAN).GetValue<bool>() ? "true" : "false";
 	} else if (option == "write_deletion_vectors") {
 		value = val.CastAs(context, LogicalType::BOOLEAN).GetValue<bool>() ? "true" : "false";
+	} else if (option == "data_file_format") {
+		// Physical format new data files are written in: 'parquet' (default) or 'vortex'.
+		value = DuckLakeInsert::ValidateDataFileFormat(val.DefaultCastAs(LogicalType::VARCHAR).GetValue<string>());
 	} else {
 		throw NotImplementedException("Unsupported option %s", option);
 	}

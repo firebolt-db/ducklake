@@ -149,6 +149,8 @@ struct DuckLakeFileInfo {
 	DataFileIndex id;
 	TableIndex table_id;
 	string file_name;
+	//! physical format; persisted to ducklake_data_file.file_format
+	string file_format = "parquet";
 	idx_t row_count;
 	idx_t file_size_bytes;
 	optional_idx footer_size;
@@ -352,7 +354,10 @@ struct DuckLakeFileData {
 	string encryption_key;
 	idx_t file_size_bytes = 0;
 	optional_idx footer_size;
+	//! delete-file format (parquet/puffin); delete files only
 	DeleteFileFormat format = DeleteFileFormat::PARQUET;
+	//! data-file format from ducklake_data_file.file_format; selects the reader
+	string data_file_format = "parquet";
 };
 
 enum class DuckLakeDataType {

@@ -1,0 +1,81 @@
+# name: test/sql/format/json_read_dispatch.test
+# description: DuckLake scan dispatches to read_<format> for non-parquet data files (json), by file_format
+# group: [format]
+#
+# DuckLake can only *write* formats whose COPY implements copy_to_bind (parquet, vortex). To verify the
+# read-side per-file dispatch independently of the writer, we register a json file by repointing a data
+# file's metadata row at it and tagging file_format='json'.
+
+require ducklake
+
+require parquet
+
+require json
+
+statement ok
+ATTACH 'ducklake:{TEST_DIR}/dl_jr.db' AS ducklake (DATA_PATH '{TEST_DIR}/dl_jr_files', METADATA_CATALOG 'ducklake_meta')
+
+statement ok
+CALL ducklake.set_option('data_inlining_row_limit', 0)
+
+statement ok
+CREATE TABLE ducklake.t(i INTEGER, s VARCHAR);
+
+statement ok
+INSERT INTO ducklake.t VALUES (1, 'a'), (2, 'bb'), (3, 'ccc');
+
+# sanity: currently a single parquet data file
+query I
+SELECT DISTINCT file_format FROM ducklake_meta.ducklake_data_file
+----
+parquet
+
+# write the same rows out as a json file (outside DuckLake), preserving row order
+statement ok
+COPY (SELECT i, s FROM ducklake.t ORDER BY i) TO '{TEST_DIR}/injected.json' (FORMAT json)
+
+# repoint the data file at the json file and tag it as json
+statement ok
+UPDATE ducklake_meta.ducklake_data_file
+SET path = '{TEST_DIR}/injected.json', path_is_relative = false, file_format = 'json'
+WHERE end_snapshot IS NULL
+
+# reattach so DuckLake picks up the externally-modified metadata
+statement ok
+DETACH ducklake
+
+statement ok
+ATTACH 'ducklake:{TEST_DIR}/dl_jr.db' AS ducklake (DATA_PATH '{TEST_DIR}/dl_jr_files', METADATA_CATALOG 'ducklake_meta')
+
+# the scan now dispatches to the json reader
+query IT
+SELECT i, s FROM ducklake.t ORDER BY i
+----
+1	a
+2	bb
+3	ccc
+
+# projection pushdown through the json reader
+query T
+SELECT s FROM ducklake.t ORDER BY i
+----
+a
+bb
+ccc
+
+# filter pushdown through the json reader
+query IT
+SELECT i, s FROM ducklake.t WHERE i >= 2 ORDER BY i
+----
+2	bb
+3	ccc
+
+query I
+SELECT COUNT(*) FROM ducklake.t
+----
+3
+
+query I
+SELECT SUM(i) FROM ducklake.t
+----
+6
