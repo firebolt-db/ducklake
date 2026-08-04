@@ -174,6 +174,11 @@ OpenFileInfo DuckLakeMultiFileList::GetFile(idx_t i) const {
 		    Value::BIGINT(NumericCast<int64_t>(inlined_data_table.schema_version));
 	} else {
 		extended_info->options["file_size"] = Value::UBIGINT(file.file_size_bytes);
+		// Record the physical format so the multi-file reader can pick the right per-file reader
+		// (parquet_scan vs. read_vortex). Absent/empty means parquet.
+		if (!file.data_file_format.empty()) {
+			extended_info->options["file_format"] = Value(file.data_file_format);
+		}
 		if (file.footer_size.IsValid()) {
 			extended_info->options["footer_size"] = Value::UBIGINT(file.footer_size.GetIndex());
 		}

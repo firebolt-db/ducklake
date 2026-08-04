@@ -80,6 +80,8 @@ public:
 
 private:
 	shared_ptr<BaseFileReader> TryCreateInlinedDataReader(const OpenFileInfo &file);
+	//! Create a non-parquet format reader based on the file's file_format extended option (else nullptr).
+	shared_ptr<BaseFileReader> TryCreateVortexReader(ClientContext &context, const OpenFileInfo &file);
 	//! For deletion scans we need to get the snapshot_id values using per-row snapshot information
 	void GatherDeletionScanSnapshots(BaseFileReader &reader, const MultiFileReaderData &reader_data, DataChunk &chunk,
 	                                 optional_idx rowid_col_override = optional_idx()) const;

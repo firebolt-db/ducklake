@@ -873,7 +873,7 @@ ORDER BY table_id;
 	return TransformGlobalStats(*result);
 }
 
-string DuckLakeMetadataManager::GetFileSelectList(const string &prefix) {
+string DuckLakeMetadataManager::GetFileSelectList(const string &prefix, bool include_data_file_format) {
 	static const vector<string> column_list {
 	    "path", "path_is_relative", "file_size_bytes", "footer_size", "encryption_key",
 	};
@@ -887,6 +887,12 @@ string DuckLakeMetadataManager::GetFileSelectList(const string &prefix) {
 		return prefix + "." + column + " AS " + prefix + "_" + column;
 	});
 
+	if (include_data_file_format) {
+		// Appended as the trailing column so it is read right after ReadDataFile's fixed columns.
+		// Only valid for the ducklake_data_file table (delete files do not have a file_format column).
+		result += ", " + prefix + ".file_format AS " + prefix + "_file_format";
+	}
+
 	return result;
 }
 
@@ -896,12 +902,15 @@ string DuckLakeMetadataManager::GetDeleteFileSelectList(const string &prefix) {
 
 template <class T>
 DuckLakeFileData DuckLakeMetadataManager::ReadDataFile(DuckLakeTableEntry &table, T &row, idx_t &col_idx,
-                                                       bool is_encrypted) {
+                                                       bool is_encrypted, bool read_data_file_format) {
 	DuckLakeFileData data;
 	if (row.IsNull(col_idx)) {
 		// file is not there
 		col_idx += 4;
 		if (is_encrypted) {
+			col_idx++;
+		}
+		if (read_data_file_format) {
 			col_idx++;
 		}
 		return data;
@@ -922,6 +931,12 @@ DuckLakeFileData DuckLakeMetadataManager::ReadDataFile(DuckLakeTableEntry &table
 			                            data.path);
 		}
 		data.encryption_key = Blob::FromBase64(row.template GetValue<string>(col_idx++));
+	}
+	if (read_data_file_format) {
+		if (!row.IsNull(col_idx)) {
+			data.data_file_format = row.template GetValue<string>(col_idx);
+		}
+		col_idx++;
 	}
 	return data;
 }
@@ -1370,7 +1385,7 @@ vector<DuckLakeFileListEntry> DuckLakeMetadataManager::GetFilesForTable(DuckLake
 		}
 	}
 
-	string select_list = "data.data_file_id, " + GetFileSelectList("data") +
+	string select_list = "data.data_file_id, " + GetFileSelectList("data", true) +
 	                     ", data.row_id_start, data.begin_snapshot, data.partial_max, data.mapping_id, " +
 	                     GetDeleteFileSelectList("del") + stats_select_list;
 
@@ -1418,7 +1433,7 @@ WHERE data.table_id=%d AND {SNAPSHOT_ID} >= data.begin_snapshot AND ({SNAPSHOT_I
 		DuckLakeFileListEntry file_entry;
 		idx_t col_idx = 0;
 		file_entry.file_id = DataFileIndex(row.GetValue<idx_t>(col_idx++));
-		file_entry.file = ReadDataFile(table, row, col_idx, IsEncrypted());
+		file_entry.file = ReadDataFile(table, row, col_idx, IsEncrypted(), true);
 		if (!row.IsNull(col_idx)) {
 			file_entry.row_id_start = row.GetValue<idx_t>(col_idx);
 		}
@@ -1464,7 +1479,7 @@ vector<DuckLakeFileListEntry> DuckLakeMetadataManager::GetTableInsertions(DuckLa
                                                                           DuckLakeSnapshot start_snapshot,
                                                                           DuckLakeSnapshot end_snapshot) {
 	auto table_id = table.GetTableId();
-	string select_list = GetFileSelectList("data") +
+	string select_list = GetFileSelectList("data", true) +
 	                     ", data.row_id_start, data.begin_snapshot, data.partial_max, data.mapping_id, " +
 	                     GetDeleteFileSelectList("del");
 	// Files either match the exact snapshot range
@@ -1497,7 +1512,7 @@ WHERE data.table_id=%d AND data.begin_snapshot <= {SNAPSHOT_ID} AND (
 	for (auto &row : *result) {
 		DuckLakeFileListEntry file_entry;
 		idx_t col_idx = 0;
-		file_entry.file = ReadDataFile(table, row, col_idx, IsEncrypted());
+		file_entry.file = ReadDataFile(table, row, col_idx, IsEncrypted(), true);
 		if (!row.IsNull(col_idx)) {
 			file_entry.row_id_start = row.GetValue<idx_t>(col_idx);
 		}
@@ -1712,7 +1727,7 @@ DuckLakeMetadataManager::GetExtendedFilesForTable(DuckLakeTableEntry &table, Duc
                                                   const FilterPushdownInfo *filter_info) {
 	auto table_id = table.GetTableId();
 	string select_list =
-	    GetFileSelectList("data") + ", data.row_id_start, " + GetDeleteFileSelectList("del") + ", del.begin_snapshot";
+	    GetFileSelectList("data", true) + ", data.row_id_start, " + GetDeleteFileSelectList("del") + ", del.begin_snapshot";
 
 	string query;
 	string where_clause;
@@ -1756,7 +1771,7 @@ WHERE data.table_id=%d AND {SNAPSHOT_ID} >= data.begin_snapshot AND ({SNAPSHOT_I
 		}
 		file_entry.row_count = row.GetValue<idx_t>(2);
 		idx_t col_idx = 3;
-		file_entry.file = ReadDataFile(table, row, col_idx, IsEncrypted());
+		file_entry.file = ReadDataFile(table, row, col_idx, IsEncrypted(), true);
 		if (!row.IsNull(col_idx)) {
 			file_entry.row_id_start = row.GetValue<idx_t>(col_idx);
 		}

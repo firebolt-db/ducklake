@@ -352,7 +352,11 @@ struct DuckLakeFileData {
 	string encryption_key;
 	idx_t file_size_bytes = 0;
 	optional_idx footer_size;
+	//! Delete-file format (parquet/puffin); only meaningful for delete files.
 	DeleteFileFormat format = DeleteFileFormat::PARQUET;
+	//! Physical data-file format read from ducklake_data_file.file_format ("parquet" or "vortex").
+	//! Selects which reader is used to scan this file.
+	string data_file_format = "parquet";
 };
 
 enum class DuckLakeDataType {

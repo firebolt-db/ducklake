@@ -1,5 +1,6 @@
 #include "storage/ducklake_multi_file_list.hpp"
 #include "storage/ducklake_multi_file_reader.hpp"
+#include "storage/ducklake_vortex_reader.hpp"
 #include "storage/ducklake_table_entry.hpp"
 #include "storage/ducklake_catalog.hpp"
 #include "storage/ducklake_delete_filter.hpp"
@@ -386,11 +387,33 @@ shared_ptr<BaseFileReader> DuckLakeMultiFileReader::TryCreateInlinedDataReader(c
 	                                                  std::move(columns));
 }
 
+shared_ptr<BaseFileReader> DuckLakeMultiFileReader::TryCreateVortexReader(ClientContext &context,
+                                                                         const OpenFileInfo &file) {
+	if (!file.extended_info) {
+		return nullptr;
+	}
+	auto entry = file.extended_info->options.find("file_format");
+	if (entry == file.extended_info->options.end()) {
+		// no format recorded - default parquet path
+		return nullptr;
+	}
+	if (!StringUtil::CIEquals(StringValue::Get(entry->second), "vortex")) {
+		return nullptr;
+	}
+	// Map the vortex file's columns onto the table's current field ids by name.
+	auto columns = DuckLakeMultiFileReader::ColumnsFromFieldData(read_info.table.GetFieldData(), true);
+	return make_shared_ptr<DuckLakeVortexReader>(read_info, file, std::move(columns));
+}
+
 shared_ptr<BaseFileReader> DuckLakeMultiFileReader::CreateReader(ClientContext &context,
                                                                  GlobalTableFunctionState &gstate,
                                                                  const OpenFileInfo &file, idx_t file_idx,
                                                                  const MultiFileBindData &bind_data) {
 	auto reader = TryCreateInlinedDataReader(file);
+	if (reader) {
+		return reader;
+	}
+	reader = TryCreateVortexReader(context, file);
 	if (reader) {
 		return reader;
 	}
@@ -402,6 +425,10 @@ shared_ptr<BaseFileReader> DuckLakeMultiFileReader::CreateReader(ClientContext &
                                                                  const MultiFileOptions &file_options,
                                                                  MultiFileReaderInterface &interface) {
 	auto reader = TryCreateInlinedDataReader(file);
+	if (reader) {
+		return reader;
+	}
+	reader = TryCreateVortexReader(context, file);
 	if (reader) {
 		return reader;
 	}
