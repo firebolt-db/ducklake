@@ -106,3 +106,44 @@ query I
 SELECT r FROM ducklake.ctas WHERE r = 500
 ----
 500
+
+# ---------------------------------------------------------------------------
+# Unsupported write combinations are rejected cleanly (statless format cannot
+# carry the metadata these need) rather than crashing or silently corrupting.
+# ---------------------------------------------------------------------------
+
+# NOT NULL columns (enforced via written null-count stats, which vortex lacks)
+statement ok
+CREATE TABLE ducklake.nn(i INTEGER NOT NULL)
+
+statement error
+INSERT INTO ducklake.nn VALUES (1)
+----
+NOT NULL columns are not yet supported
+
+# partitioned writes (need one file per partition value + recorded partition_values)
+statement ok
+CREATE TABLE ducklake.part(i INTEGER, p INTEGER)
+
+statement ok
+ALTER TABLE ducklake.part SET PARTITIONED BY (p)
+
+statement error
+INSERT INTO ducklake.part VALUES (1, 10)
+----
+Partitioned writes are not yet supported
+
+# flushing inlined data (derives begin_snapshot / row_id_start from stats)
+statement ok
+CALL ducklake.set_option('data_inlining_row_limit', 100)
+
+statement ok
+CREATE TABLE ducklake.inl(i INTEGER)
+
+statement ok
+INSERT INTO ducklake.inl VALUES (1)
+
+statement error
+CALL ducklake_flush_inlined_data('ducklake')
+----
+Flushing inlined data is not yet supported

@@ -111,6 +111,19 @@ void DuckLakeInsert::AddWrittenFiles(ClientContext &context, DuckLakeInsertGloba
 	if (global_state.file_format != "parquet") {
 		// non-parquet writers return CHANGED_ROWS_AND_FILE_LIST: {count, files[]}. There are no per-file
 		// stats, so derive the size from the filesystem and map the whole row count to the single file.
+		if (set_snapshot_id) {
+			// flush of inlined data derives begin_snapshot / row_id_start from the written file's
+			// snapshot_id / row_id column statistics, which non-parquet files do not carry
+			throw NotImplementedException("Flushing inlined data is not yet supported for the '%s' data file "
+			                              "format - set data_inlining_row_limit to 0 for such tables",
+			                              global_state.file_format);
+		}
+		if (!global_state.not_null_fields.empty()) {
+			// NOT NULL is enforced by inspecting written null-count statistics, which non-parquet files
+			// do not carry - reject rather than silently allow NULLs into a NOT NULL column
+			throw NotImplementedException("NOT NULL columns are not yet supported for the '%s' data file format",
+			                              global_state.file_format);
+		}
 		auto &fs = FileSystem::GetFileSystem(context);
 		for (idx_t r = 0; r < chunk.size(); r++) {
 			auto files_value = chunk.GetValue(1, r);
@@ -542,6 +555,13 @@ DuckLakeCopyOptions DuckLakeInsert::GetCopyOptions(ClientContext &context, DuckL
 	data_file_format = ValidateDataFileFormat(data_file_format);
 	const bool is_parquet = data_file_format == "parquet";
 	info->format = data_file_format;
+
+	if (!is_parquet && copy_input.partition_data) {
+		// non-parquet writes emit a single file with no per-file stats, so partition assignment (which
+		// requires one file per partition value + recorded partition_values) is not supported yet
+		throw NotImplementedException("Partitioned writes are not yet supported for the '%s' data file format",
+		                              data_file_format);
+	}
 
 	if (is_parquet) {
 		// field ids are parquet-only; non-parquet files are mapped by column name at read time
