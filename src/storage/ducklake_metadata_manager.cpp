@@ -1266,12 +1266,11 @@ FilterSQLResult DuckLakeMetadataManager::ConvertFilterPushdownToSQL(const Filter
 		if (!conditions.empty()) {
 			conditions += " AND ";
 		}
-		// Keep a file if its stats say it might match, OR if it has no stats row for this column at all
-		// (e.g. files written in a format that produces no column statistics) - those can't be pruned.
-		conditions += StringUtil::Format(
-		    "(data.data_file_id IN (SELECT data_file_id FROM %s WHERE %s(%s)) OR data.data_file_id NOT IN (SELECT "
-		    "data_file_id FROM %s))",
-		    cte_name, null_checks.c_str(), filter_condition.c_str(), cte_name);
+		// A file is kept when its stats say it might match. The CTE LEFT JOINs every data file to its
+		// column stats, so files with no stats row for this column (e.g. formats that produce no column
+		// statistics) appear with NULL stats and are kept by the null checks - they cannot be pruned.
+		conditions += StringUtil::Format("data.data_file_id IN (SELECT data_file_id FROM %s WHERE %s(%s))", cte_name,
+		                                 null_checks.c_str(), filter_condition.c_str());
 
 		CTERequirement req(column_filter.column_field_index, referenced_stats);
 		result.required_ctes.emplace(column_filter.column_field_index, std::move(req));
@@ -1299,18 +1298,24 @@ DuckLakeMetadataManager::GenerateCTESectionFromRequirements(const unordered_map<
 		}
 		first_cte = false;
 
-		string select_list = "data_file_id";
+		// Every data file for the table, LEFT JOINed to its column stats: files that have no stats row
+		// for this column appear with NULL stats (rather than being dropped), so the null checks in the
+		// pushdown condition keep them instead of pruning them.
+		string select_list = "df.data_file_id";
 		for (const auto &stat : req.referenced_stats) {
-			select_list += ", " + stat;
+			select_list += ", cs." + stat;
 		}
 
 		string materialized_hint = (req.reference_count > 1) ? " AS MATERIALIZED" : " AS NOT MATERIALIZED";
 
 		cte_section += StringUtil::Format("col_%d_stats%s (\n", req.column_field_index, materialized_hint.c_str());
 		cte_section += StringUtil::Format("  SELECT %s\n", select_list.c_str());
-		cte_section += "  FROM {METADATA_CATALOG}.ducklake_file_column_stats\n";
-		cte_section +=
-		    StringUtil::Format("  WHERE column_id = %d AND table_id = %d\n", req.column_field_index, table_id.index);
+		cte_section += "  FROM {METADATA_CATALOG}.ducklake_data_file df\n";
+		cte_section += StringUtil::Format("  LEFT JOIN {METADATA_CATALOG}.ducklake_file_column_stats cs\n"
+		                                  "    ON cs.data_file_id = df.data_file_id AND cs.table_id = df.table_id AND "
+		                                  "cs.column_id = %d\n",
+		                                  req.column_field_index);
+		cte_section += StringUtil::Format("  WHERE df.table_id = %d\n", table_id.index);
 		cte_section += ")";
 	}
 

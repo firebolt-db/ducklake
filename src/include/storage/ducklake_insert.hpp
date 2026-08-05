@@ -157,6 +157,8 @@ struct DuckLakeCopyInput {
 	TableIndex table_id;
 	InsertVirtualColumns virtual_columns = InsertVirtualColumns::NONE;
 	optional_idx get_table_index;
+	//! Whether the target table has any NOT NULL columns (enforced via written null-count stats)
+	bool has_not_null_columns = false;
 };
 
 } // namespace duckdb
