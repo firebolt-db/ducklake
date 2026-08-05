@@ -804,6 +804,11 @@ void TransformGlobalStatsRow(const ROW &row, vector<DuckLakeGlobalStatsInfo> &gl
 
 	auto &stats_entry = global_stats.back();
 
+	if (row.IsNull(1 + from_column)) {
+		// table has table-level stats but no per-column stats (e.g. a table written only in a format
+		// that does not produce column statistics) - the LEFT JOIN yields a NULL column_id
+		return;
+	}
 	DuckLakeGlobalColumnStatsInfo column_stats;
 	column_stats.column_id = FieldIndex(row.template GetValue<uint64_t>(1 + from_column));
 
@@ -1261,6 +1266,9 @@ FilterSQLResult DuckLakeMetadataManager::ConvertFilterPushdownToSQL(const Filter
 		if (!conditions.empty()) {
 			conditions += " AND ";
 		}
+		// A file is kept when its stats say it might match. The CTE LEFT JOINs every data file to its
+		// column stats, so files with no stats row for this column (e.g. formats that produce no column
+		// statistics) appear with NULL stats and are kept by the null checks - they cannot be pruned.
 		conditions += StringUtil::Format("data.data_file_id IN (SELECT data_file_id FROM %s WHERE %s(%s))", cte_name,
 		                                 null_checks.c_str(), filter_condition.c_str());
 
@@ -1290,18 +1298,24 @@ DuckLakeMetadataManager::GenerateCTESectionFromRequirements(const unordered_map<
 		}
 		first_cte = false;
 
-		string select_list = "data_file_id";
+		// Every data file for the table, LEFT JOINed to its column stats: files that have no stats row
+		// for this column appear with NULL stats (rather than being dropped), so the null checks in the
+		// pushdown condition keep them instead of pruning them.
+		string select_list = "df.data_file_id";
 		for (const auto &stat : req.referenced_stats) {
-			select_list += ", " + stat;
+			select_list += ", cs." + stat;
 		}
 
 		string materialized_hint = (req.reference_count > 1) ? " AS MATERIALIZED" : " AS NOT MATERIALIZED";
 
 		cte_section += StringUtil::Format("col_%d_stats%s (\n", req.column_field_index, materialized_hint.c_str());
 		cte_section += StringUtil::Format("  SELECT %s\n", select_list.c_str());
-		cte_section += "  FROM {METADATA_CATALOG}.ducklake_file_column_stats\n";
-		cte_section +=
-		    StringUtil::Format("  WHERE column_id = %d AND table_id = %d\n", req.column_field_index, table_id.index);
+		cte_section += "  FROM {METADATA_CATALOG}.ducklake_data_file df\n";
+		cte_section += StringUtil::Format("  LEFT JOIN {METADATA_CATALOG}.ducklake_file_column_stats cs\n"
+		                                  "    ON cs.data_file_id = df.data_file_id AND cs.table_id = df.table_id AND "
+		                                  "cs.column_id = %d\n",
+		                                  req.column_field_index);
+		cte_section += StringUtil::Format("  WHERE df.table_id = %d\n", table_id.index);
 		cte_section += ")";
 	}
 
@@ -3225,9 +3239,11 @@ string DuckLakeMetadataManager::WriteNewDataFiles(DuckLakeSnapshot &commit_snaps
 	batch_query +=
 	    StringUtil::Format("INSERT INTO {METADATA_CATALOG}.ducklake_data_file VALUES %s;", data_file_insert_query);
 
-	// insert the column stats
-	batch_query += StringUtil::Format("INSERT INTO {METADATA_CATALOG}.ducklake_file_column_stats VALUES %s;",
-	                                  column_stats_insert_query);
+	// insert the column stats (non-parquet files may have none)
+	if (!column_stats_insert_query.empty()) {
+		batch_query += StringUtil::Format("INSERT INTO {METADATA_CATALOG}.ducklake_file_column_stats VALUES %s;",
+		                                  column_stats_insert_query);
+	}
 
 	if (!partition_insert_query.empty()) {
 		// insert the partition values
@@ -3894,15 +3910,18 @@ string DuckLakeMetadataManager::UpdateGlobalTableStats(const DuckLakeGlobalStats
 		batch_query +=
 		    StringUtil::Format("INSERT INTO {METADATA_CATALOG}.ducklake_table_stats VALUES (%d, %d, %d, %d);",
 		                       stats.table_id.index, stats.record_count, stats.next_row_id, stats.table_size_bytes);
-		batch_query += StringUtil::Format("INSERT INTO {METADATA_CATALOG}.ducklake_table_column_stats VALUES %s;",
-		                                  column_stats_values);
+		if (!column_stats_values.empty()) {
+			batch_query += StringUtil::Format("INSERT INTO {METADATA_CATALOG}.ducklake_table_column_stats VALUES %s;",
+			                                  column_stats_values);
+		}
 	} else {
 		// stats have been initialized - update them
 		batch_query += StringUtil::Format(
 		    "UPDATE {METADATA_CATALOG}.ducklake_table_stats SET record_count=%d, file_size_bytes=%d, "
 		    "next_row_id=%d WHERE table_id=%d;",
 		    stats.record_count, stats.table_size_bytes, stats.next_row_id, stats.table_id.index);
-		batch_query += StringUtil::Format(R"(
+		if (!column_stats_values.empty()) {
+			batch_query += StringUtil::Format(R"(
 WITH new_values(tid, cid, new_contains_null, new_contains_nan, new_min, new_max, new_extra_stats) AS (
 VALUES %s
 )
@@ -3911,7 +3930,8 @@ SET contains_null=new_contains_null::boolean, contains_nan=new_contains_nan::boo
 FROM new_values
 WHERE table_id=tid AND column_id=cid;
 )",
-		                                  column_stats_values);
+			                                  column_stats_values);
+		}
 	}
 	return batch_query;
 }

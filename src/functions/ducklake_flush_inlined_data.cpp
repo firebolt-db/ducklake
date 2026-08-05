@@ -99,7 +99,7 @@ unique_ptr<GlobalSinkState> DuckLakeFlushData::GetGlobalSinkState(ClientContext 
 
 SinkResultType DuckLakeFlushData::Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const {
 	auto &global_state = input.global_state.Cast<DuckLakeInsertGlobalState>();
-	DuckLakeInsert::AddWrittenFiles(global_state, chunk, encryption_key, partition_id, true);
+	DuckLakeInsert::AddWrittenFiles(context.client, global_state, chunk, encryption_key, partition_id, true);
 	return SinkResultType::NEED_MORE_INPUT;
 }
 
@@ -302,6 +302,7 @@ unique_ptr<LogicalOperator> DuckLakeDataFlusher::GenerateFlushCommand() {
 	DuckLakeCopyInput copy_input(context, table);
 	copy_input.get_table_index = table_idx;
 	copy_input.virtual_columns = InsertVirtualColumns::WRITE_ROW_ID_AND_SNAPSHOT_ID;
+	copy_input.is_flush = true;
 
 	auto copy_options = DuckLakeInsert::GetCopyOptions(context, copy_input);
 
