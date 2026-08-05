@@ -18,6 +18,9 @@
 #include "duckdb/planner/parsed_data/bound_create_table_info.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "duckdb/planner/expression/bound_case_expression.hpp"
+#include "duckdb/planner/expression/bound_operator_expression.hpp"
+#include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/common/multi_file/multi_file_reader.hpp"
 #include "duckdb/main/extension_helper.hpp"
 #include "duckdb/function/function_binder.hpp"
@@ -371,7 +374,7 @@ DuckLakeCopyInput::DuckLakeCopyInput(ClientContext &context, DuckLakeTableEntry 
 	schema_id = table.ParentSchema().Cast<DuckLakeSchemaEntry>().GetSchemaId();
 	table_id = table.GetTableId();
 	encryption_key = catalog.GenerateEncryptionKey(context);
-	has_not_null_columns = !table.GetNotNullFields().empty();
+	not_null_columns = table.GetNotNullFields();
 }
 
 DuckLakeCopyInput::DuckLakeCopyInput(ClientContext &context, DuckLakeSchemaEntry &schema, const ColumnList &columns,
@@ -562,11 +565,6 @@ DuckLakeCopyOptions DuckLakeInsert::GetCopyOptions(ClientContext &context, DuckL
 			                              "set data_inlining_row_limit to 0 for such tables",
 			                              data_file_format);
 		}
-		if (copy_input.has_not_null_columns) {
-			// NOT NULL is enforced by inspecting written null-count statistics
-			throw NotImplementedException("NOT NULL columns are not yet supported for the '%s' data file format",
-			                              data_file_format);
-		}
 		if (copy_input.is_compaction) {
 			// compaction's directory + rotation output does not compose with the single-file path used
 			// for non-parquet writes yet
@@ -676,6 +674,10 @@ DuckLakeCopyOptions DuckLakeInsert::GetCopyOptions(ClientContext &context, DuckL
 
 	DuckLakeCopyOptions result(std::move(info), copy_fun.function);
 	result.bind_data = std::move(function_data);
+	if (!is_parquet) {
+		// non-parquet files carry no null-count stats; enforce NOT NULL with a streaming projection instead
+		result.not_null_columns = copy_input.not_null_columns;
+	}
 
 	result.use_tmp_file = false;
 	if (copy_input.partition_data) {
@@ -779,6 +781,43 @@ unique_ptr<LogicalOperator> DuckLakeInsert::InsertCasts(Binder &binder, unique_p
 	return std::move(result);
 }
 
+// Build CASE WHEN col IS NULL THEN error('NOT NULL constraint failed: ...') ELSE col END for a NOT NULL
+// column, so a NULL aborts the write. Used for formats that carry no null-count statistics.
+static unique_ptr<Expression> WrapNotNullCheck(ClientContext &context, const LogicalType &type, idx_t index,
+                                               const string &column_name) {
+	auto is_null = make_uniq<BoundOperatorExpression>(ExpressionType::OPERATOR_IS_NULL, LogicalType::BOOLEAN);
+	is_null->children.push_back(make_uniq<BoundReferenceExpression>(type, index));
+
+	vector<unique_ptr<Expression>> error_args;
+	error_args.push_back(
+	    make_uniq<BoundConstantExpression>(Value("NOT NULL constraint failed: " + column_name)));
+	FunctionBinder binder(context);
+	ErrorData error;
+	auto error_call = binder.BindScalarFunction(DEFAULT_SCHEMA, "error", std::move(error_args), error, false);
+	if (!error_call) {
+		error.Throw();
+	}
+	auto then_expr = BoundCastExpression::AddCastToType(context, std::move(error_call), type);
+	auto else_expr = make_uniq<BoundReferenceExpression>(type, index);
+	return make_uniq<BoundCaseExpression>(std::move(is_null), std::move(then_expr), std::move(else_expr));
+}
+
+// Insert a projection that validates NOT NULL columns (passing every value through unchanged, but
+// aborting on a NULL in a constrained column). Column order matches copy_options.names.
+static void GenerateNotNullProjection(ClientContext &context, PhysicalPlanGenerator &planner,
+                                      const DuckLakeCopyOptions &copy_options, optional_ptr<PhysicalOperator> &plan) {
+	vector<unique_ptr<Expression>> expressions;
+	for (idx_t i = 0; i < copy_options.expected_types.size(); i++) {
+		auto &type = copy_options.expected_types[i];
+		if (i < copy_options.names.size() && copy_options.not_null_columns.count(copy_options.names[i])) {
+			expressions.push_back(WrapNotNullCheck(context, type, i, copy_options.names[i]));
+		} else {
+			expressions.push_back(make_uniq<BoundReferenceExpression>(type, i));
+		}
+	}
+	GenerateProjection(context, planner, expressions, plan);
+}
+
 PhysicalOperator &DuckLakeInsert::PlanCopyForInsert(ClientContext &context, PhysicalPlanGenerator &planner,
                                                     DuckLakeCopyInput &copy_input,
                                                     optional_ptr<PhysicalOperator> plan) {
@@ -804,6 +843,12 @@ PhysicalOperator &DuckLakeInsert::PlanCopyForInsert(ClientContext &context, Phys
 				}
 			}
 		}
+	}
+
+	if (!copy_options.not_null_columns.empty() && plan) {
+		// non-parquet formats carry no null-count stats - validate NOT NULL columns as data streams to
+		// the writer (mirrors the parquet path, which rejects after inspecting the written file's stats)
+		GenerateNotNullProjection(context, planner, copy_options, plan);
 	}
 
 	auto copy_return_types = GetCopyFunctionReturnLogicalTypes(copy_options.return_type);

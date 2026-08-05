@@ -112,14 +112,30 @@ SELECT r FROM ducklake.ctas WHERE r = 500
 # carry the metadata these need) rather than crashing or silently corrupting.
 # ---------------------------------------------------------------------------
 
-# NOT NULL columns (enforced via written null-count stats, which vortex lacks)
+# NOT NULL columns: enforced with a streaming validation projection (vortex carries no null-count stats)
 statement ok
-CREATE TABLE ducklake.nn(i INTEGER NOT NULL)
+CREATE TABLE ducklake.nn(i INTEGER NOT NULL, s VARCHAR)
 
+# non-null rows are accepted
+statement ok
+INSERT INTO ducklake.nn VALUES (1, 'a'), (2, 'b')
+
+# a NULL in the NOT NULL column is rejected
 statement error
-INSERT INTO ducklake.nn VALUES (1)
+INSERT INTO ducklake.nn VALUES (3, 'c'), (NULL, 'd')
 ----
-NOT NULL columns are not yet supported
+NOT NULL constraint failed
+
+# NULLs in a nullable column are fine
+statement ok
+INSERT INTO ducklake.nn VALUES (4, NULL)
+
+query IT
+SELECT i, s FROM ducklake.nn ORDER BY i
+----
+1	a
+2	b
+4	NULL
 
 # partitioned writes (need one file per partition value + recorded partition_values)
 statement ok

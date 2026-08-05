@@ -140,6 +140,10 @@ struct DuckLakeCopyOptions {
 
 	//! Set of projection columns to execute prior to inserting (if any)
 	vector<unique_ptr<Expression>> projection_list;
+
+	//! Names of columns that must be validated NOT NULL with a streaming projection (non-parquet formats
+	//! that carry no null-count statistics). Empty for parquet, which checks stats after writing.
+	case_insensitive_set_t not_null_columns;
 };
 
 struct DuckLakeCopyInput {
@@ -157,8 +161,9 @@ struct DuckLakeCopyInput {
 	TableIndex table_id;
 	InsertVirtualColumns virtual_columns = InsertVirtualColumns::NONE;
 	optional_idx get_table_index;
-	//! Whether the target table has any NOT NULL columns (enforced via written null-count stats)
-	bool has_not_null_columns = false;
+	//! Names of the target table's NOT NULL columns. For non-parquet formats (which carry no null-count
+	//! statistics) these are enforced with a streaming validation projection instead.
+	case_insensitive_set_t not_null_columns;
 	//! Whether this write is a flush of inlined data (recovers begin_snapshot / row_id_start from the
 	//! written file's snapshot_id / row_id column statistics). Compaction shares the same virtual columns
 	//! but does not need those stats, so it is distinguished by this flag rather than by virtual_columns.
