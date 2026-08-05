@@ -302,6 +302,7 @@ unique_ptr<LogicalOperator> DuckLakeDataFlusher::GenerateFlushCommand() {
 	DuckLakeCopyInput copy_input(context, table);
 	copy_input.get_table_index = table_idx;
 	copy_input.virtual_columns = InsertVirtualColumns::WRITE_ROW_ID_AND_SNAPSHOT_ID;
+	copy_input.is_flush = true;
 
 	auto copy_options = DuckLakeInsert::GetCopyOptions(context, copy_input);
 

@@ -554,9 +554,10 @@ DuckLakeCopyOptions DuckLakeInsert::GetCopyOptions(ClientContext &context, DuckL
 			throw NotImplementedException("Partitioned writes are not yet supported for the '%s' data file format",
 			                              data_file_format);
 		}
-		if (copy_input.virtual_columns == InsertVirtualColumns::WRITE_ROW_ID_AND_SNAPSHOT_ID) {
+		if (copy_input.is_flush) {
 			// flush of inlined data derives begin_snapshot / row_id_start from the written file's
-			// snapshot_id / row_id column statistics
+			// snapshot_id / row_id column statistics (compaction shares the same virtual columns but
+			// does not need those stats, so it is not blocked here)
 			throw NotImplementedException("Flushing inlined data is not yet supported for the '%s' data file format - "
 			                              "set data_inlining_row_limit to 0 for such tables",
 			                              data_file_format);
@@ -564,6 +565,12 @@ DuckLakeCopyOptions DuckLakeInsert::GetCopyOptions(ClientContext &context, DuckL
 		if (copy_input.has_not_null_columns) {
 			// NOT NULL is enforced by inspecting written null-count statistics
 			throw NotImplementedException("NOT NULL columns are not yet supported for the '%s' data file format",
+			                              data_file_format);
+		}
+		if (copy_input.is_compaction) {
+			// compaction's directory + rotation output does not compose with the single-file path used
+			// for non-parquet writes yet
+			throw NotImplementedException("Compaction is not yet supported for the '%s' data file format",
 			                              data_file_format);
 		}
 	}

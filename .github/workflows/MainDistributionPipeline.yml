@@ -45,5 +45,7 @@ jobs:
       extension_name: ducklake
       duckdb_version: ${{ needs.get-duckdb-version.outputs.duckdb_version }}
       ci_tools_version: main
+      # windows is not built (see duckdb-next-build), so exclude it from deploy too
+      exclude_archs: "windows_amd64;windows_amd64_mingw;windows_amd64_rtools"
       deploy_latest: ${{ startsWith(github.ref, 'refs/heads/v') || github.ref == 'refs/heads/main' }}
       deploy_versioned: ${{ startsWith(github.ref, 'refs/heads/v') || github.ref == 'refs/heads/main' }}

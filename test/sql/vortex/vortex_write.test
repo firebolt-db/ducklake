@@ -133,6 +133,21 @@ INSERT INTO ducklake.part VALUES (1, 10)
 ----
 Partitioned writes are not yet supported
 
+# compaction (merge_adjacent_files) - directory+rotation output not composed with single-file writes yet
+statement ok
+CREATE TABLE ducklake.cmp(i INTEGER)
+
+statement ok
+INSERT INTO ducklake.cmp VALUES (1)
+
+statement ok
+INSERT INTO ducklake.cmp VALUES (2)
+
+statement error
+CALL ducklake_merge_adjacent_files('ducklake')
+----
+Compaction is not yet supported
+
 # flushing inlined data (derives begin_snapshot / row_id_start from stats)
 statement ok
 CALL ducklake.set_option('data_inlining_row_limit', 100)

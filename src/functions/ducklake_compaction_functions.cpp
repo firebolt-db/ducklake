@@ -504,6 +504,7 @@ DuckLakeCompactor::GenerateCompactionCommand(vector<DuckLakeCompactionFileEntry>
 	}
 
 	DuckLakeCopyInput copy_input(context, table, data_path);
+	copy_input.is_compaction = true;
 	// merge_adjacent_files does not use partitioning information - instead we always merge within partitions
 	copy_input.partition_data = nullptr;
 	if (write_row_id) {

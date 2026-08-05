@@ -159,6 +159,13 @@ struct DuckLakeCopyInput {
 	optional_idx get_table_index;
 	//! Whether the target table has any NOT NULL columns (enforced via written null-count stats)
 	bool has_not_null_columns = false;
+	//! Whether this write is a flush of inlined data (recovers begin_snapshot / row_id_start from the
+	//! written file's snapshot_id / row_id column statistics). Compaction shares the same virtual columns
+	//! but does not need those stats, so it is distinguished by this flag rather than by virtual_columns.
+	bool is_flush = false;
+	//! Whether this write is a compaction (merge_adjacent_files). Its directory+rotation output model
+	//! does not compose with the single-file path used for non-parquet formats yet.
+	bool is_compaction = false;
 };
 
 } // namespace duckdb
