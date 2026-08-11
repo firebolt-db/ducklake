@@ -1,0 +1,73 @@
+# name: test/sql/vortex/vortex_write_s3.test
+# description: INSERT into a vortex-format DuckLake table on S3 and read it back. Regression for the
+#              double-slash data-file path that rolled back commits on S3.
+# group: [vortex]
+
+require ducklake
+
+require parquet
+
+require vortex
+
+require httpfs
+
+require-env S3_TEST_SERVER_AVAILABLE 1
+
+test-env DUCKLAKE_CONNECTION __TEST_DIR__/{UUID}.db
+
+statement ok
+ATTACH 'ducklake:${DUCKLAKE_CONNECTION}' AS ducklake (DATA_PATH 's3://test-bucket/vortex_write_s3', METADATA_CATALOG 'ducklake_meta')
+
+statement ok
+CALL ducklake.set_option('data_inlining_row_limit', 0)
+
+statement ok
+CALL ducklake.set_option('data_file_format', 'vortex')
+
+statement ok
+CREATE TABLE ducklake.t(i INTEGER, s VARCHAR, d DOUBLE, l INTEGER[])
+
+# Regression: the vortex data-file path was previously built with an unguarded join, producing a
+# double slash (`.../<schema>/<table>//<file>`). A local filesystem silently collapses `//`, but S3
+# (minio) rejects the empty path segment on the post-write stats read-back, so this INSERT used to
+# roll back with `XMinioInvalidObjectName`. It must now COMMIT.
+statement ok
+INSERT INTO ducklake.t VALUES (1, 'a', 1.5, [1, 2]), (2, 'bb', NULL, []), (3, 'ccc', 3.5, [9])
+
+# a second insert -> a second vortex file, also on S3
+statement ok
+INSERT INTO ducklake.t VALUES (4, 'd', 4.5, [4])
+
+# the writes really committed as vortex data files (this is empty if the transactions rolled back)
+query II
+SELECT file_format, SUM(record_count)
+FROM ducklake_meta.ducklake_data_file WHERE end_snapshot IS NULL GROUP BY file_format
+----
+vortex	4
+
+# no data-file path contains a double slash
+query I
+SELECT COUNT(*) FROM ducklake_meta.ducklake_data_file WHERE path LIKE '%//%'
+----
+0
+
+# full round-trip read from S3 (types, NULLs, nested list, across both files)
+query IITR
+SELECT i, s, l, d FROM ducklake.t ORDER BY i
+----
+1	a	[1, 2]	1.5
+2	bb	[]	NULL
+3	ccc	[9]	3.5
+4	d	[4]	4.5
+
+# filter pushdown across the S3-backed vortex files
+query IT
+SELECT i, s FROM ducklake.t WHERE i >= 3 ORDER BY i
+----
+3	ccc
+4	d
+
+query II
+SELECT COUNT(*), SUM(i) FROM ducklake.t
+----
+4	10
