@@ -711,7 +711,10 @@ DuckLakeCopyOptions DuckLakeInsert::GetCopyOptions(ClientContext &context, DuckL
 		result.file_size_bytes = optional_idx();
 		auto &transaction = DuckLakeTransaction::Get(context, catalog);
 		auto file_name = "ducklake-" + transaction.GenerateUUID() + "." + data_file_format;
-		result.file_path = fs.JoinPath(copy_input.data_path, file_name);
+		// Use DuckLakeUtil::JoinPath (not FileSystem::JoinPath): data_path may already end with a separator
+		// (table data paths are generated with a trailing separator), and FileSystem::JoinPath appends the
+		// separator unconditionally, producing a double slash that S3/minio rejects on the stats read-back.
+		result.file_path = DuckLakeUtil::JoinPath(fs, copy_input.data_path, file_name);
 		result.file_extension = "";
 		result.write_empty_file = false;
 	}
