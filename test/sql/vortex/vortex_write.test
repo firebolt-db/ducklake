@@ -108,18 +108,27 @@ SELECT r FROM ducklake.ctas WHERE r = 500
 500
 
 # ---------------------------------------------------------------------------
-# Unsupported write combinations are rejected cleanly (statless format cannot
-# carry the metadata these need) rather than crashing or silently corrupting.
+# NOT NULL columns are supported: vortex reports per-file null-count stats via
+# WRITTEN_FILE_STATISTICS, so the constraint is enforced from the written stats.
 # ---------------------------------------------------------------------------
 
-# NOT NULL columns (enforced via written null-count stats, which vortex lacks)
 statement ok
 CREATE TABLE ducklake.nn(i INTEGER NOT NULL)
 
-statement error
+# a non-null insert is accepted
+statement ok
 INSERT INTO ducklake.nn VALUES (1)
+
+# a null insert is rejected by the NOT NULL constraint (checked from the null-count stat)
+statement error
+INSERT INTO ducklake.nn VALUES (NULL)
 ----
-NOT NULL columns are not yet supported
+NOT NULL constraint failed
+
+# ---------------------------------------------------------------------------
+# Write combinations that still need multi-file output are rejected cleanly
+# (Gap 2) rather than crashing or silently corrupting.
+# ---------------------------------------------------------------------------
 
 # partitioned writes (need one file per partition value + recorded partition_values)
 statement ok

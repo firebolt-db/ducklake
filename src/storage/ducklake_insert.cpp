@@ -108,39 +108,9 @@ DuckLakeColumnStats DuckLakeInsert::ParseColumnStats(const LogicalType &type, co
 
 void DuckLakeInsert::AddWrittenFiles(ClientContext &context, DuckLakeInsertGlobalState &global_state, DataChunk &chunk,
                                      const string &encryption_key, optional_idx partition_id, bool set_snapshot_id) {
-	if (global_state.file_format != "parquet") {
-		// non-parquet writers return CHANGED_ROWS_AND_FILE_LIST: {count, files[]}. There are no per-file
-		// stats, so derive the size from the filesystem and map the whole row count to the single file.
-		// (Combinations that need per-file stats - partitioning, flush, NOT NULL - are rejected in
-		// GetCopyOptions before anything is written.)
-		auto &fs = FileSystem::GetFileSystem(context);
-		for (idx_t r = 0; r < chunk.size(); r++) {
-			auto files_value = chunk.GetValue(1, r);
-			if (files_value.IsNull()) {
-				continue;
-			}
-			auto &file_list = ListValue::GetChildren(files_value);
-			if (file_list.empty()) {
-				continue;
-			}
-			if (file_list.size() != 1) {
-				throw NotImplementedException("Writing '%s' data files is only supported as a single file per write",
-				                              global_state.file_format);
-			}
-			DuckLakeDataFile data_file;
-			data_file.file_name = file_list[0].GetValue<string>();
-			data_file.file_format = global_state.file_format;
-			data_file.row_count = chunk.GetValue(0, r).GetValue<idx_t>();
-			auto handle = fs.OpenFile(data_file.file_name, FileFlags::FILE_FLAGS_READ);
-			data_file.file_size_bytes = NumericCast<idx_t>(fs.GetFileSize(*handle));
-			data_file.encryption_key = encryption_key;
-			if (partition_id.IsValid()) {
-				data_file.partition_id = partition_id.GetIndex();
-			}
-			global_state.written_files.push_back(std::move(data_file));
-		}
-		return;
-	}
+	// Both parquet and vortex return WRITTEN_FILE_STATISTICS ({filename, row_count, file_size,
+	// footer_size, column_stats, partition_keys}); the vortex path is single-file/non-partitioned but
+	// otherwise consumes the same chunk shape.
 	for (idx_t r = 0; r < chunk.size(); r++) {
 		DuckLakeDataFile data_file;
 		data_file.file_name = chunk.GetValue(0, r).GetValue<string>();
@@ -547,8 +517,11 @@ DuckLakeCopyOptions DuckLakeInsert::GetCopyOptions(ClientContext &context, DuckL
 	info->format = data_file_format;
 
 	if (!is_parquet) {
-		// non-parquet writes emit a single file with no per-file column statistics. Reject the cases that
-		// rely on those stats here, before anything is written, so no orphan file is left on disk.
+		// non-parquet writes (vortex) now report per-file column statistics via
+		// WRITTEN_FILE_STATISTICS, so NOT NULL constraints are enforced from the written null-count
+		// (see AddWrittenFiles). The remaining cases below need multi-file output or the inlined-data
+		// virtual-column plumbing, which the single-file non-parquet path does not compose with yet;
+		// reject them here, before anything is written, so no orphan file is left on disk.
 		if (copy_input.partition_data) {
 			// partition assignment requires one file per partition value + recorded partition_values
 			throw NotImplementedException("Partitioned writes are not yet supported for the '%s' data file format",
@@ -560,11 +533,6 @@ DuckLakeCopyOptions DuckLakeInsert::GetCopyOptions(ClientContext &context, DuckL
 			// does not need those stats, so it is not blocked here)
 			throw NotImplementedException("Flushing inlined data is not yet supported for the '%s' data file format - "
 			                              "set data_inlining_row_limit to 0 for such tables",
-			                              data_file_format);
-		}
-		if (copy_input.has_not_null_columns) {
-			// NOT NULL is enforced by inspecting written null-count statistics
-			throw NotImplementedException("NOT NULL columns are not yet supported for the '%s' data file format",
 			                              data_file_format);
 		}
 		if (copy_input.is_compaction) {
@@ -700,11 +668,12 @@ DuckLakeCopyOptions DuckLakeInsert::GetCopyOptions(ClientContext &context, DuckL
 	if (is_parquet) {
 		result.return_type = CopyFunctionReturnType::WRITTEN_FILE_STATISTICS;
 	} else {
-		// non-parquet COPY functions (vortex) can't report per-file statistics; take the written file
-		// list instead and derive size/row-count ourselves. They also don't implement rotate_next_file,
-		// so we can't use DuckDB's directory+rotation naming - generate a single full file path here
-		// (the plain single-file COPY path) so the writer receives a file, not the table directory.
-		result.return_type = CopyFunctionReturnType::CHANGED_ROWS_AND_FILE_LIST;
+		// The vortex COPY function reports per-file statistics via its copy_to_get_written_statistics
+		// hook, so request them - AddWrittenFiles consumes the same WRITTEN_FILE_STATISTICS chunk as
+		// parquet. Vortex still does not implement rotate_next_file, so we can't use DuckDB's
+		// directory+rotation naming - generate a single full file path here (the plain single-file
+		// COPY path) so the writer receives a file, not the table directory.
+		result.return_type = CopyFunctionReturnType::WRITTEN_FILE_STATISTICS;
 		result.rotate = false;
 		result.per_thread_output = false;
 		result.partition_output = false;
