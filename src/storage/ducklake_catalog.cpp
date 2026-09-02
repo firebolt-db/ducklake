@@ -365,9 +365,8 @@ unique_ptr<DuckLakeCatalogSet> DuckLakeCatalog::LoadSchemaForSnapshot(DuckLakeTr
 			for (auto &tag : col_info.tags) {
 				if (tag.key == "comment") {
 					column.SetComment(tag.value);
-				} else {
-					throw NotImplementedException("Only comment tags are supported for columns currently");
 				}
+				// Ignore unrecognized column tags: other systems may add their own.
 			}
 			auto default_val = field_id->GetDefault();
 			if (default_val) {
