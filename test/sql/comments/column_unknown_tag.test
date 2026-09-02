@@ -1,0 +1,56 @@
+# name: test/sql/comments/column_unknown_tag.test
+# description: An unrecognized column tag must be ignored on read, not error
+# group: [comments]
+
+require ducklake
+
+require parquet
+
+statement ok
+ATTACH 'ducklake:__TEST_DIR__/unknown_col_tag.db' AS ducklake (DATA_PATH '__TEST_DIR__/unknown_col_tag_files', METADATA_CATALOG 'meta')
+
+statement ok
+CREATE TABLE ducklake.t(id INTEGER, flag INTEGER);
+
+statement ok
+INSERT INTO ducklake.t VALUES (1, 0), (2, 1);
+
+# Another system may stamp its own column tags into the catalog. DuckDB never writes
+# non-comment column tags itself, so inject one straight into the metadata table.
+statement ok
+INSERT INTO meta.ducklake_column_tag
+SELECT c.table_id, c.column_id, c.begin_snapshot, NULL, 'other_system_metadata', 'x'
+FROM meta.ducklake_column c
+JOIN meta.ducklake_table t ON t.table_id = c.table_id AND t.end_snapshot IS NULL
+WHERE t.table_name = 't' AND c.column_name = 'flag' AND c.end_snapshot IS NULL;
+
+statement ok
+DETACH ducklake;
+
+# Re-attach so the schema is loaded fresh from the catalog: the unrecognized tag is ignored.
+statement ok
+ATTACH 'ducklake:__TEST_DIR__/unknown_col_tag.db' AS ducklake (METADATA_CATALOG 'meta')
+
+query II
+SELECT id, flag FROM ducklake.t ORDER BY id;
+----
+1	0
+2	1
+
+# A comment tag alongside the ignored one is still applied.
+statement ok
+COMMENT ON COLUMN ducklake.t.id IS 'the id';
+
+statement ok
+DETACH ducklake;
+
+statement ok
+ATTACH 'ducklake:__TEST_DIR__/unknown_col_tag.db' AS ducklake (METADATA_CATALOG 'meta')
+
+query I
+SELECT comment FROM duckdb_columns() WHERE table_name = 't' AND column_name = 'id';
+----
+the id
+
+statement ok
+DETACH ducklake;
