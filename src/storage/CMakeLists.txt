@@ -25,6 +25,7 @@ add_library(
   ducklake_partition_data.cpp
   ducklake_secret.cpp
   ducklake_stats.cpp
+  ducklake_stats_copy.cpp
   ducklake_table_entry.cpp
   ducklake_initializer.cpp
   ducklake_autoload_helper.cpp

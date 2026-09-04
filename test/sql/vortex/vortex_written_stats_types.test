@@ -1,0 +1,357 @@
+# name: test/sql/vortex/vortex_written_stats_types.test
+# description: Adversarial coverage for in-stream written statistics (DuckLakeStatsCopy):
+#              every stats-capable type with extreme values, NaN/inf semantics, all-NULL and
+#              empty writes, the oversized-string bound cap, counts-only types, cross-chunk
+#              bounds, parallel sinks, multi-insert global merges, and the read-side consumers
+#              of the recorded bounds.
+# group: [vortex]
+
+require ducklake
+
+require parquet
+
+require vortex
+
+statement ok
+ATTACH 'ducklake:{TEST_DIR}/dl_vstats.db' AS ducklake (DATA_PATH '{TEST_DIR}/dl_vstats_files', METADATA_CATALOG 'ducklake_meta')
+
+statement ok
+CALL ducklake.set_option('data_inlining_row_limit', 0)
+
+statement ok
+CALL ducklake.set_option('data_file_format', 'vortex')
+
+# ---------------------------------------------------------------------------
+# Every stats-capable type, with type extremes, negatives, and NULLs
+# ---------------------------------------------------------------------------
+statement ok
+CREATE TABLE ducklake.t_types(
+    b BOOLEAN, i1 TINYINT, i2 SMALLINT, i4 INTEGER, i8 BIGINT,
+    u1 UTINYINT, u4 UINTEGER, u8 UBIGINT,
+    f FLOAT, d DOUBLE, dec1 DECIMAL(18,3),
+    dt DATE, tm TIME, ts TIMESTAMP, s VARCHAR)
+
+statement ok
+INSERT INTO ducklake.t_types VALUES
+    (false, -128, -32768, -2147483648, -9223372036854775808,
+     0, 0, 0,
+     -3.5, -1e300, -999999999999999.999,
+     DATE '1900-01-05', TIME '00:00:00', TIMESTAMP '1900-01-05 01:02:03.456789', ''),
+    (true, 127, 32767, 2147483647, 9223372036854775807,
+     255, 4294967295, 18446744073709551615,
+     3.5, 1e300, 999999999999999.999,
+     DATE '2999-12-31', TIME '23:59:59.999999', TIMESTAMP '2999-12-31 23:59:59.999999', 'zz "quoted" 日本語'),
+    (NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+     NULL, NULL, NULL, NULL, NULL, NULL, NULL),
+    (false, 0, 0, 0, 0, 1, 1, 1, 0.0, 0.0, 0.0,
+     DATE '2024-06-15', TIME '12:00:00', TIMESTAMP '2024-06-15 12:00:00', 'middle')
+
+query IIIII
+SELECT column_id, min_value, max_value, null_count, value_count
+FROM ducklake_meta.ducklake_file_column_stats ORDER BY column_id
+----
+1	false	true	1	3
+2	-128	127	1	3
+3	-32768	32767	1	3
+4	-2147483648	2147483647	1	3
+5	-9223372036854775808	9223372036854775807	1	3
+6	0	255	1	3
+7	0	4294967295	1	3
+8	0	18446744073709551615	1	3
+9	-3.5	3.5	1	3
+10	-1e+300	1e+300	1	3
+11	-999999999999999.999	999999999999999.999	1	3
+12	1900-01-05	2999-12-31	1	3
+13	00:00:00	23:59:59.999999	1	3
+14	1900-01-05 01:02:03.456789	2999-12-31 23:59:59.999999	1	3
+15	(empty)	zz "quoted" 日本語	1	3
+
+# types outside vortex's type system fail cleanly at bind (pinned here so a
+# silent change in that behaviour is noticed): 128-bit ints, UUID, INTERVAL
+statement ok
+CREATE TABLE ducklake.t_i128(h HUGEINT)
+
+statement error
+INSERT INTO ducklake.t_i128 VALUES (1)
+----
+not in Vortex type system
+
+statement ok
+CREATE TABLE ducklake.t_uuid(u UUID)
+
+statement error
+INSERT INTO ducklake.t_uuid VALUES ('00000000-0000-0000-0000-000000000001')
+----
+conversion is not supported
+
+statement ok
+CREATE TABLE ducklake.t_interval(iv INTERVAL)
+
+statement error
+INSERT INTO ducklake.t_interval VALUES (INTERVAL 3 DAYS)
+----
+conversion is not supported
+
+# timestamptz is stats-capable
+statement ok
+CREATE TABLE ducklake.t_tstz(tz TIMESTAMPTZ)
+
+statement ok
+INSERT INTO ducklake.t_tstz VALUES (TIMESTAMP '2024-01-01 00:00:00'), (TIMESTAMP '2025-06-01 12:30:00'), (NULL)
+
+query IIII
+SELECT min_value, max_value, null_count, value_count
+FROM ducklake_meta.ducklake_file_column_stats
+WHERE data_file_id = (SELECT data_file_id FROM ducklake_meta.ducklake_data_file d JOIN ducklake_meta.ducklake_table t USING (table_id) WHERE t.table_name = 't_tstz')
+----
+2024-01-01 00:00:00+00	2025-06-01 12:30:00+00	1	2
+
+# the recorded bounds feed the read side: filters at and beyond the bounds
+query I
+SELECT count(*) FROM ducklake.t_types WHERE i4 = -2147483648
+----
+1
+
+query I
+SELECT count(*) FROM ducklake.t_types WHERE i8 > 0
+----
+1
+
+# negative-heavy ORDER BY .. LIMIT (sort-key compression guard with negatives)
+query I
+SELECT i2 FROM ducklake.t_types ORDER BY i2 ASC LIMIT 1
+----
+-32768
+
+# ---------------------------------------------------------------------------
+# Floats: NaN excluded from bounds and flagged; infinities ARE bounds
+# ---------------------------------------------------------------------------
+statement ok
+CREATE TABLE ducklake.t_float(f FLOAT, d DOUBLE, all_nan DOUBLE)
+
+statement ok
+INSERT INTO ducklake.t_float VALUES
+    (1.5, 'inf', 'nan'), ('nan', '-inf', 'nan'), (-2.5, 42.0, 'nan'), ('nan', 'nan', 'nan')
+
+query IIIIII
+SELECT column_id, min_value, max_value, null_count, value_count, contains_nan
+FROM ducklake_meta.ducklake_file_column_stats
+WHERE data_file_id = (SELECT data_file_id FROM ducklake_meta.ducklake_data_file d JOIN ducklake_meta.ducklake_table t USING (table_id) WHERE t.table_name = 't_float')
+ORDER BY column_id
+----
+1	-2.5	1.5	0	4	true
+2	-inf	inf	0	4	true
+3	NULL	NULL	0	4	true
+
+# NaN rows are still found by scans (bounds must not prune them away)
+query I
+SELECT count(*) FROM ducklake.t_float WHERE isnan(f)
+----
+2
+
+# ---------------------------------------------------------------------------
+# Counts-only types: no bounds recorded, counts exact
+# ---------------------------------------------------------------------------
+statement ok
+CREATE TABLE ducklake.t_nominmax(bl BLOB, li INTEGER[], st STRUCT(a INTEGER))
+
+statement ok
+INSERT INTO ducklake.t_nominmax VALUES
+    ('\xAA\xBB', [1, 2], {'a': 1}),
+    ('\x00', [], {'a': NULL}),
+    (NULL, NULL, NULL)
+
+query IIIII
+SELECT column_id, min_value, max_value, null_count, value_count
+FROM ducklake_meta.ducklake_file_column_stats
+WHERE data_file_id = (SELECT data_file_id FROM ducklake_meta.ducklake_data_file d JOIN ducklake_meta.ducklake_table t USING (table_id) WHERE t.table_name = 't_nominmax')
+ORDER BY column_id
+----
+1	NULL	NULL	1	2
+2	NULL	NULL	1	2
+4	NULL	NULL	1	2
+
+# equality filters still work without bounds
+query I
+SELECT count(*) FROM ducklake.t_nominmax WHERE bl = '\x00'::BLOB
+----
+1
+
+# ---------------------------------------------------------------------------
+# All-NULL column and empty write
+# ---------------------------------------------------------------------------
+statement ok
+CREATE TABLE ducklake.t_allnull(i INTEGER, s VARCHAR)
+
+statement ok
+INSERT INTO ducklake.t_allnull SELECT NULL, NULL FROM range(100)
+
+query IIIII
+SELECT column_id, min_value, max_value, null_count, value_count
+FROM ducklake_meta.ducklake_file_column_stats
+WHERE data_file_id = (SELECT data_file_id FROM ducklake_meta.ducklake_data_file d JOIN ducklake_meta.ducklake_table t USING (table_id) WHERE t.table_name = 't_allnull')
+ORDER BY column_id
+----
+1	NULL	NULL	100	0
+2	NULL	NULL	100	0
+
+query I
+SELECT count(*) FROM ducklake.t_allnull WHERE i = 5
+----
+0
+
+# an INSERT writing zero rows registers no data file and no stats
+statement ok
+CREATE TABLE ducklake.t_empty(i INTEGER)
+
+statement ok
+INSERT INTO ducklake.t_empty SELECT 1 WHERE 1 = 0
+
+query I
+SELECT count(*) FROM ducklake_meta.ducklake_data_file d
+JOIN ducklake_meta.ducklake_table t USING (table_id) WHERE t.table_name = 't_empty'
+----
+0
+
+# ---------------------------------------------------------------------------
+# Oversized string bounds are dropped (a truncated max is not an upper bound)
+# ---------------------------------------------------------------------------
+statement ok
+CREATE TABLE ducklake.t_bigstr(s VARCHAR)
+
+# one value inside the 1024-byte cap, one outside
+statement ok
+INSERT INTO ducklake.t_bigstr VALUES (repeat('a', 1024)), (repeat('z', 1025))
+
+query IIII
+SELECT min_value IS NULL, max_value IS NULL, null_count, value_count
+FROM ducklake_meta.ducklake_file_column_stats
+WHERE data_file_id = (SELECT data_file_id FROM ducklake_meta.ducklake_data_file d JOIN ducklake_meta.ducklake_table t USING (table_id) WHERE t.table_name = 't_bigstr')
+----
+true	true	0	2
+
+# values at exactly the cap keep their bounds
+statement ok
+CREATE TABLE ducklake.t_capstr(s VARCHAR)
+
+statement ok
+INSERT INTO ducklake.t_capstr VALUES (repeat('a', 1024)), ('b')
+
+query II
+SELECT min_value = repeat('a', 1024), max_value
+FROM ducklake_meta.ducklake_file_column_stats
+WHERE data_file_id = (SELECT data_file_id FROM ducklake_meta.ducklake_data_file d JOIN ducklake_meta.ducklake_table t USING (table_id) WHERE t.table_name = 't_capstr')
+----
+true	b
+
+# ---------------------------------------------------------------------------
+# Cross-chunk bounds and parallel sinks: 500k rows, extremes far apart, exact
+# ---------------------------------------------------------------------------
+statement ok
+CREATE TABLE ducklake.t_big(i INTEGER, s VARCHAR)
+
+statement ok
+INSERT INTO ducklake.t_big
+SELECT CASE WHEN x = 480000 THEN -1000000 WHEN x = 20000 THEN 1000000
+            WHEN x % 97 = 0 THEN NULL ELSE (x % 5000)::INTEGER END,
+       'k' || (x % 1000)
+FROM range(500000) t(x)
+
+query IIII
+SELECT min_value, max_value, null_count, value_count
+FROM ducklake_meta.ducklake_file_column_stats s
+JOIN ducklake_meta.ducklake_data_file d USING (data_file_id)
+JOIN ducklake_meta.ducklake_table t ON d.table_id = t.table_id
+WHERE t.table_name = 't_big' AND s.column_id = 1
+----
+-1000000	1000000	5155	494845
+
+query III
+SELECT count(*), min(i), max(i) FROM ducklake.t_big
+----
+500000	-1000000	1000000
+
+query I
+SELECT count(*) FROM ducklake.t_big WHERE i = 1000000
+----
+1
+
+# ---------------------------------------------------------------------------
+# Multiple inserts merge the global bounds across snapshots
+# ---------------------------------------------------------------------------
+statement ok
+CREATE TABLE ducklake.t_merge(i INTEGER)
+
+statement ok
+INSERT INTO ducklake.t_merge VALUES (10), (20)
+
+statement ok
+INSERT INTO ducklake.t_merge VALUES (-5)
+
+statement ok
+INSERT INTO ducklake.t_merge VALUES (NULL), (99)
+
+query III
+SELECT min_value, max_value, contains_null
+FROM ducklake_meta.ducklake_table_column_stats s
+JOIN ducklake_meta.ducklake_table t USING (table_id)
+WHERE t.table_name = 't_merge'
+----
+-5	99	true
+
+# ---------------------------------------------------------------------------
+# NOT NULL enforced from written stats; a failed insert commits nothing
+# ---------------------------------------------------------------------------
+statement ok
+CREATE TABLE ducklake.t_nn(i INTEGER NOT NULL, s VARCHAR)
+
+statement ok
+INSERT INTO ducklake.t_nn VALUES (1, 'a')
+
+statement error
+INSERT INTO ducklake.t_nn SELECT CASE WHEN x = 90000 THEN NULL ELSE x::INTEGER END, 'v' FROM range(100000) t(x)
+----
+NOT NULL constraint failed
+
+query II
+SELECT count(*), max(i) FROM ducklake.t_nn
+----
+1	1
+
+# ---------------------------------------------------------------------------
+# Reverse mixed order: vortex file first, then parquet, bounds still merge
+# ---------------------------------------------------------------------------
+statement ok
+CREATE TABLE ducklake.t_rev(i INTEGER)
+
+statement ok
+INSERT INTO ducklake.t_rev SELECT x::INTEGER FROM range(500, 600) t(x)
+
+statement ok
+CALL ducklake.set_option('data_file_format', 'parquet')
+
+statement ok
+INSERT INTO ducklake.t_rev SELECT x::INTEGER FROM range(0, 100) t(x)
+
+query II
+SELECT file_format, count(*) FROM ducklake_meta.ducklake_data_file d
+JOIN ducklake_meta.ducklake_table t USING (table_id)
+WHERE t.table_name = 't_rev' GROUP BY file_format ORDER BY file_format
+----
+parquet	1
+vortex	1
+
+query III
+SELECT count(*), min(i), max(i) FROM ducklake.t_rev
+----
+200	0	599
+
+query I
+SELECT count(*) FROM ducklake.t_rev WHERE i = 550
+----
+1
+
+query I
+SELECT i FROM ducklake.t_rev ORDER BY i DESC LIMIT 1
+----
+599
