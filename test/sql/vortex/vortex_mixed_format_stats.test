@@ -1,0 +1,98 @@
+# name: test/sql/vortex/vortex_mixed_format_stats.test
+# description: Vortex writes record real per-file column statistics. Regression: the vortex COPY
+#              reports no statistics, and appending such a file left parquet-only bounds in
+#              ducklake_table_column_stats; readers trust those bounds, so filters on
+#              out-of-bounds values folded to empty (WHERE id = 300 -> no rows, count(*) WHERE
+#              id >= 250 -> 0) and DuckDB's sort-key compression packed ORDER BY columns into the
+#              stale range's width, returning values truncated mod 256 for ORDER BY ... LIMIT.
+#              The insert path now computes the statistics from the written file itself.
+# group: [vortex]
+
+require ducklake
+
+require parquet
+
+require vortex
+
+statement ok
+ATTACH 'ducklake:{TEST_DIR}/dl_mixed_stats.db' AS ducklake (DATA_PATH '{TEST_DIR}/dl_mixed_stats_files', METADATA_CATALOG 'ducklake_meta')
+
+statement ok
+CALL ducklake.set_option('data_inlining_row_limit', 0)
+
+statement ok
+CREATE TABLE ducklake.m(id INTEGER, s VARCHAR)
+
+# parquet file with ids 0..249
+statement ok
+INSERT INTO ducklake.m SELECT i::INTEGER, 'val_' || i FROM range(0, 250) t(i)
+
+query II
+SELECT min_value, max_value FROM ducklake_meta.ducklake_table_column_stats WHERE column_id = 1
+----
+0	249
+
+# vortex file with ids 250..499 and some NULL strings
+statement ok
+CALL ducklake.set_option('data_file_format', 'vortex')
+
+statement ok
+INSERT INTO ducklake.m SELECT i::INTEGER, CASE WHEN i % 13 = 0 THEN NULL ELSE 'val_' || i END FROM range(250, 500) t(i)
+
+# the vortex file records real per-file column statistics, like parquet
+query IIIII
+SELECT s.column_id, s.min_value, s.max_value, s.null_count, s.value_count
+FROM ducklake_meta.ducklake_file_column_stats s
+JOIN ducklake_meta.ducklake_data_file f USING (data_file_id)
+WHERE f.file_format = 'vortex'
+ORDER BY s.column_id
+----
+1	250	499	0	250
+2	val_250	val_499	19	231
+
+# and the global bounds now cover the whole table
+query III
+SELECT min_value, max_value, contains_null FROM ducklake_meta.ducklake_table_column_stats WHERE column_id = 1
+----
+0	499	false
+
+query III
+SELECT min_value, max_value, contains_null FROM ducklake_meta.ducklake_table_column_stats WHERE column_id = 2
+----
+val_0	val_99	true
+
+# both files scanned as one table: filters on values above the old bound must match
+query II
+SELECT id, s FROM ducklake.m WHERE id = 300
+----
+300	val_300
+
+query I
+SELECT count(*) FROM ducklake.m WHERE id >= 250
+----
+250
+
+# ORDER BY + LIMIT must not truncate the sort column to stale bounds' width
+# (this returned 243/242 = 499/498 mod 256 before the fix)
+query II
+SELECT id, s FROM ducklake.m ORDER BY id DESC LIMIT 2
+----
+499	val_499
+498	val_498
+
+query II
+SELECT min(id), max(id) FROM ducklake.m
+----
+0	499
+
+# NOT NULL is now enforced for vortex writes from the computed null counts
+statement ok
+CREATE TABLE ducklake.nn(id INTEGER NOT NULL, s VARCHAR)
+
+statement ok
+INSERT INTO ducklake.nn VALUES (1, 'a'), (2, 'b')
+
+statement error
+INSERT INTO ducklake.nn VALUES (NULL, 'c')
+----
+NOT NULL constraint failed
